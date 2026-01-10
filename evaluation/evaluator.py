@@ -14,8 +14,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tokenizer.tokenizer import SimpleByteTokenizer, BytePairTokenizer
 from models.mamba2 import Mamba2Model
-from models.rwkv_x import RWKVXModel
-from models.xlstm import XLSTMModel
 from evaluation.test_syntax import SyntaxTestSuite
 from evaluation.test_programming import ProgrammingTestSuite
 from evaluation.test_algorithmic import AlgorithmicTestSuite
@@ -107,29 +105,19 @@ class Evaluator:
             vocab_size = config_dict.get('vocab_size', self.tokenizer.vocab_size)
             d_model = config_dict.get('d_model', 512)
             n_layers = config_dict.get('n_layers', 6)
+            mamba2_d_state = config_dict.get('d_state', 16)
+            mamba2_d_conv = config_dict.get('d_conv', 4)
+            mamba2_expand = config_dict.get('expand', 2)
         
         # Create model based on detected type
-        if model_type == 'rwkv_x' or model_type == 'rwkv':
-            model = RWKVXModel(
-                vocab_size=vocab_size,
-                d_model=d_model,
-                n_layers=n_layers
-            )
-        elif model_type == 'xlstm':
-            model = XLSTMModel(
-                vocab_size=vocab_size,
-                d_model=d_model,
-                n_layers=n_layers
-            )
-        elif model_type == 'mamba2' or model_type == 'mamba':
             model = Mamba2Model(
                 vocab_size=vocab_size,
                 d_model=d_model,
-                n_layers=n_layers
+                n_layers=n_layers,
+                d_state=mamba2_d_state,
+                d_conv=mamba2_d_conv,
+                expand=mamba2_expand,
             )
-        else:
-            # Default to Mamba2
-            model = Mamba2Model(vocab_size=vocab_size, d_model=d_model, n_layers=n_layers)
         
         # Load weights
         model.load_state_dict(checkpoint['model_state_dict'])

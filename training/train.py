@@ -28,8 +28,8 @@ def get_model(model_name: str, vocab_size: int, config: TrainingConfig):
             d_state=config.mamba2_d_state,
             d_conv=config.mamba2_d_conv,
             expand=config.mamba2_expand,
-            max_seq_len=config.max_seq_len
         )
+
     elif model_name == 'rwkv_x':
         return RWKVXModel(
             vocab_size=vocab_size,
