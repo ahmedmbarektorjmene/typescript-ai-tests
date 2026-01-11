@@ -40,6 +40,12 @@ class TrainingConfig:
     mamba2_d_conv: int = 4
     mamba2_expand: int = 2
     
+    # Enhanced Mamba2 parameters
+    enhanced_mamba2_n_scales: int = 3
+    enhanced_mamba2_n_symbols: int = 32
+    enhanced_mamba2_symbol_dim: int = 64
+    enhanced_mamba2_use_rule_aux_loss: bool = True
+    
     rwkv_x_attn_size: int = 64
     rwkv_x_sparse_topk: int = 32
     

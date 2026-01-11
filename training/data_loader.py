@@ -70,7 +70,7 @@ class CodeDataset(Dataset):
         }
 
 
-def collect_code_files(data_dir: str, extensions: List[str] = ['.ts', '.js', '.tsx', '.jsx']) -> List[str]:
+def collect_code_files(data_dir: str, extensions: List[str] = ['.ts', '.js', '.tsx', '.jsx', '.txt']) -> List[str]:
     """
     Collect all code files from a directory
     """

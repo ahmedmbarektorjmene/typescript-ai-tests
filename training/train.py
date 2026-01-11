@@ -12,8 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import TrainingConfig
 from tokenizer.tokenizer import SimpleByteTokenizer, BytePairTokenizer
 from models.mamba2 import Mamba2Model
-from models.rwkv_x import RWKVXModel
-from models.xlstm import XLSTMModel
+from models.mamba3 import EnhancedMamba2Model
+# from models.rwkv_x import RWKVXModel
+# from models.xlstm import XLSTMModel
 from training.trainer import Trainer
 from training.data_loader import create_dataloader
 
@@ -30,31 +31,27 @@ def get_model(model_name: str, vocab_size: int, config: TrainingConfig):
             expand=config.mamba2_expand,
         )
 
-    elif model_name == 'rwkv_x':
-        return RWKVXModel(
+    elif model_name == 'enhanced_mamba2':
+        return EnhancedMamba2Model(
             vocab_size=vocab_size,
             d_model=config.d_model,
             n_layers=config.n_layers,
-            attn_size=config.rwkv_x_attn_size,
-            sparse_topk=config.rwkv_x_sparse_topk,
-            max_seq_len=config.max_seq_len
+            d_state=config.mamba2_d_state,
+            d_conv=config.mamba2_d_conv,
+            expand=config.mamba2_expand,
+            n_scales=config.enhanced_mamba2_n_scales,
+            n_symbols=config.enhanced_mamba2_n_symbols,
+            symbol_dim=config.enhanced_mamba2_symbol_dim,
+            use_rule_aux_loss=config.enhanced_mamba2_use_rule_aux_loss
         )
-    elif model_name == 'xlstm':
-        return XLSTMModel(
-            vocab_size=vocab_size,
-            d_model=config.d_model,
-            n_layers=config.n_layers,
-            head_dim=config.xlstm_head_dim,
-            use_mlstm=config.xlstm_use_mlstm,
-            max_seq_len=config.max_seq_len
-        )
+
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
 
 def main():
     parser = argparse.ArgumentParser(description='Train sequence models')
-    parser.add_argument('--model', type=str, required=True, choices=['mamba2', 'rwkv_x', 'xlstm'],
+    parser.add_argument('--model', type=str, required=True, choices=['mamba2', 'enhanced_mamba2'],
                         help='Model architecture to train')
     parser.add_argument('--data_dir', type=str, default='data',
                         help='Directory containing training data')
