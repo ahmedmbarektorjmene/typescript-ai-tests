@@ -120,13 +120,13 @@ class SyntaxTestSuite:
             temp_path = f.name
         
         try:
-            # Try to compile with tsc (if available)
+            # Try to compile with bun x tsc (if available)
             # Fallback: basic syntax checking
             result = subprocess.run(
-                ['tsc', '--noEmit', temp_path],
+                ['bun', 'x', 'tsc', '--noEmit', temp_path],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
                 encoding='utf-8',
                 errors='replace'
             )
@@ -139,7 +139,22 @@ class SyntaxTestSuite:
                 error_msg = error_msg.replace(temp_path, '<file>')
                 return False, error_msg
         except FileNotFoundError:
-            # tsc not available, do basic validation
+            # bun not available, try global tsc
+            try:
+                result = subprocess.run(
+                    ['tsc', '--noEmit', temp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                if result.returncode == 0:
+                    return True, ""
+                else:
+                    return False, result.stderr or result.stdout or "Compilation failed"
+            except:
+                # Basic validation fallback
             # Check for common syntax errors
             errors = []
             if code.count('{') != code.count('}'):

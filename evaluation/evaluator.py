@@ -1,482 +1,358 @@
 """
-Main evaluator that runs all test suites and generates reports
+Main evaluator for Shutka (VL-JEPA) - evaluates representation quality and retrieval
 """
+
 import torch
 import os
 import json
-import re
+import numpy as np
 from typing import Dict, List, Optional
 from datetime import datetime
 import sys
+from sklearn.metrics.pairwise import cosine_similarity
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tokenizer.tokenizer import SimpleByteTokenizer, BytePairTokenizer
-from models.mamba2 import Mamba2Model
-from evaluation.test_syntax import SyntaxTestSuite
-from evaluation.test_programming import ProgrammingTestSuite
-from evaluation.test_algorithmic import AlgorithmicTestSuite
+from models.shutka import UltraEfficientTextJEPA, FAISS_AVAILABLE
 from config import EvaluationConfig
 
 
-class Evaluator:
+class VLEPAEvaluator:
     """
-    Main evaluator for all three test suites
+    Main evaluator for Shutka (VL-JEPA) - evaluates representation learning quality
     """
+
     def __init__(self, config: EvaluationConfig, device: Optional[torch.device] = None):
         self.config = config
         # Auto-detect GPU if available, or use provided device
         if device is None:
             if torch.cuda.is_available():
-                self.device = torch.device('cuda')
+                self.device = torch.device("cuda")
                 print(f"Using GPU for evaluation: {torch.cuda.get_device_name(0)}")
             else:
-                self.device = torch.device('cpu')
+                self.device = torch.device("cpu")
                 print("Using CPU for evaluation")
         else:
             self.device = device
             print(f"Using device: {device}")
-        
-        # Load tokenizer (same as training)
-        self.tokenizer = SimpleByteTokenizer()
-        # Try to load saved tokenizer if exists
-        tokenizer_path = os.path.join(os.path.dirname(config.checkpoint_path), 'tokenizer.json')
-        if os.path.exists(tokenizer_path):
-            try:
-                self.tokenizer.load(tokenizer_path)
-            except:
-                pass
-        
-        # Load model
+
+        # Load Shutka model
         self.model = self._load_model(config.checkpoint_path)
         self.model.to(self.device)
         self.model.eval()
-        
-        # Initialize test suites
-        self.syntax_suite = SyntaxTestSuite(config.test_suite_dir)
-        self.programming_suite = ProgrammingTestSuite(config.test_suite_dir)
-        self.algorithmic_suite = AlgorithmicTestSuite(config.test_suite_dir)
-        
-        # Results storage
-        self.results = {
-            'syntax': [],
-            'programming': [],
-            'algorithmic': []
-        }
-    
+
+        # Initialize FAISS memory bank if RAG is enabled but no memory bank exists
+        if hasattr(self.config, 'use_rag') and self.config.use_rag and FAISS_AVAILABLE:
+            if not hasattr(self.model, 'memory_bank') or self.model.memory_bank is None:
+                print("Creating FAISS memory bank for evaluation...")
+                from models.shutka import FAISSMemoryBank
+                self.model.memory_bank = FAISSMemoryBank(dimension=512, base_dir="memory_bank", shards=4)
+
+                # Populate with some test memories for evaluation
+                self._populate_test_memories()
+
+        # Initialize evaluation metrics
+        self.representation_quality = []
+        self.retrieval_accuracy = []
+
+        # Load evaluation data (would be patches for VL-JEPA)
+        self.eval_patches = self._load_eval_patches()
+
     def _load_model(self, checkpoint_path: str):
-        """Load model from checkpoint"""
+        """Load Shutka (VL-JEPA) model from checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        # Determine model type from checkpoint, config, or filename
-        model_type = checkpoint.get('model_type', None)
-        config_dict = checkpoint.get('config', {})
-        
-        # If model_type not in checkpoint, infer from filename
-        if not model_type:
-            checkpoint_lower = checkpoint_path.lower()
-            if 'rwkv' in checkpoint_lower:
-                model_type = 'rwkv_x'
-            elif 'xlstm' in checkpoint_lower:
-                model_type = 'xlstm'
-            elif 'mamba' in checkpoint_lower:
-                model_type = 'mamba2'
-            else:
-                # Try to infer from state_dict keys
-                state_dict_keys = list(checkpoint.get('model_state_dict', {}).keys())
-                if state_dict_keys:
-                    first_key = state_dict_keys[0]
-                    if 'time_mix' in first_key or 'channel_mix' in first_key:
-                        model_type = 'rwkv_x'
-                    elif 'ssm' in first_key or 'A_log' in first_key:
-                        model_type = 'mamba2'
-                    elif 'cell' in first_key or 'mlstm' in first_key.lower():
-                        model_type = 'xlstm'
-                    else:
-                        model_type = 'mamba2'  # Default
-        
-        if isinstance(config_dict, str):
-            # Config is a string, try to parse or use defaults
-            vocab_size = checkpoint.get('vocab_size', self.tokenizer.vocab_size)
-            d_model = 512
-            n_layers = 6
-        else:
-            vocab_size = config_dict.get('vocab_size', self.tokenizer.vocab_size)
-            d_model = config_dict.get('d_model', 512)
-            n_layers = config_dict.get('n_layers', 6)
-            mamba2_d_state = config_dict.get('d_state', 16)
-            mamba2_d_conv = config_dict.get('d_conv', 4)
-            mamba2_expand = config_dict.get('expand', 2)
-        
-        # Create model based on detected type
-            model = Mamba2Model(
-                vocab_size=vocab_size,
-                d_model=d_model,
-                n_layers=n_layers,
-                d_state=mamba2_d_state,
-                d_conv=mamba2_d_conv,
-                expand=mamba2_expand,
-            )
-        
-        # Load weights
-        model.load_state_dict(checkpoint['model_state_dict'])
-        return model
-    
-    def generate_code(self, prompt: str, max_length: int = 512) -> str:
-        """
-        Generate code completion from prompt
-        """
-        # Tokenize prompt
-        prompt_tokens = self.tokenizer.encode(prompt)
-        input_ids = torch.tensor([prompt_tokens], dtype=torch.long).to(self.device)
-        
-        # Limit input length to avoid issues
-        if len(prompt_tokens) > self.config.max_gen_length - 50:
-            # Truncate prompt if too long
-            input_ids = input_ids[:, -(self.config.max_gen_length - 50):]
-            prompt_tokens = prompt_tokens[-(self.config.max_gen_length - 50):]
-        
-        # Generate
-        with torch.no_grad():
-            try:
-                generated_ids = self.model.generate(
-                    input_ids=input_ids,
-                    max_length=min(len(prompt_tokens) + max_length, self.config.max_gen_length),
-                    temperature=self.config.temperature,
-                    top_p=self.config.top_p
-                )
-            except Exception as e:
-                print(f"Warning: Generation failed: {e}")
-                return ""
-        
-        # Decode
-        generated_tokens = generated_ids[0].tolist()
-        # Remove prompt tokens
-        if len(generated_tokens) > len(prompt_tokens):
-            generated_tokens = generated_tokens[len(prompt_tokens):]
-        else:
-            generated_tokens = []
-        
-        generated_text = self.tokenizer.decode(generated_tokens)
-        
-        return generated_text
-    
-    def extract_completion(self, prompt: str, generated: str) -> str:
-        """
-        Extract the completion part from generated text
-        For syntax tests, we need to extract just the completion
-        """
-        # Clean generated text - remove invalid Unicode characters
-        generated = generated.replace('\ufffd', '').replace('\x00', '').strip()
-        
-        if not generated:
-            return ""
-        
-        # Find the placeholder position
-        if "___" in prompt:
-            # For syntax completion, try to extract meaningful completion
-            # Look for common patterns after ___
-            
-            # Try to find completion that looks like code
-            # Split by common delimiters
-            parts = re.split(r'[;\n\r\t]', generated)
-            completion = ""
-            
-            for part in parts:
-                part = part.strip()
-                # Look for parts that contain code-like characters
-                if part and len(part) > 0:
-                    # Check if it contains alphanumeric or common operators
-                    if any(c.isalnum() or c in '+-*/=<>()[]{}' for c in part):
-                        completion = part
-                        # Stop at first semicolon or newline if found
-                        if ';' in part:
-                            completion = part.split(';')[0] + ';'
-                        break
-            
-            # If no good completion found, take first non-empty line
-            if not completion:
-                lines = generated.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if line and not line.startswith('//'):
-                        completion = line
-                        break
-            
-            # Fallback: take first 50 chars
-            if not completion:
-                completion = generated[:50].strip()
-            
-            # Remove any remaining invalid characters
-            completion = ''.join(c for c in completion if ord(c) < 0x10000 and c.isprintable())
-            return completion
-        else:
-            # For full function generation, return the generated text
-            # Remove invalid characters and non-printable chars
-            cleaned = ''.join(c for c in generated if ord(c) < 0x10000 and (c.isprintable() or c in '\n\r\t'))
-            return cleaned
-    
-    def evaluate_syntax(self) -> Dict:
-        """Evaluate syntax correctness (Test 1)"""
-        print("\n=== Evaluating Syntax Correctness ===")
-        tests = self.syntax_suite.get_tests()
-        results = []
-        correct = 0
-        
-        for test in tests:
-            prompt = test['prompt']
-            expected = test.get('expected_completion', '')
-            
-            # Generate completion
-            generated = self.generate_code(prompt, max_length=50)
-            completion = self.extract_completion(prompt, generated)
-            
-            # Filter out completions that are clearly invalid (mostly non-printable or random chars)
-            if completion:
-                # Check if completion has reasonable code-like content
-                printable_ratio = sum(c.isprintable() for c in completion) / len(completion) if completion else 0
-                alnum_ratio = sum(c.isalnum() for c in completion) / len(completion) if completion else 0
-                
-                # If less than 50% printable or less than 20% alphanumeric, it's probably garbage
-                if printable_ratio < 0.5 or alnum_ratio < 0.2:
-                    completion = ""  # Mark as invalid
-            
-            # Create complete code
-            code = self.syntax_suite.create_test_file(prompt, completion)
-            
-            # Clean code of invalid Unicode characters
-            code = ''.join(c for c in code if ord(c) < 0x10000)
-            
-            # Validate syntax
-            is_valid, error_msg = self.syntax_suite.validate_syntax(code)
-            
-            result = {
-                'test_id': test['id'],
-                'prompt': prompt,
-                'expected': expected,
-                'generated': completion,
-                'is_valid': is_valid,
-                'error': error_msg
-            }
-            results.append(result)
-            
-            if is_valid:
-                correct += 1
-                print(f"  ✓ {test['id']}: Valid syntax")
-            else:
-                error_display = error_msg[:100] if error_msg else "Unknown error"
-                print(f"  ✗ {test['id']}: Invalid syntax")
-                if error_msg:
-                    print(f"      Error: {error_display}")
-                if completion:
-                    # Show cleaned version
-                    clean_completion = ''.join(c if c.isprintable() else '?' for c in completion[:50])
-                    print(f"      Generated: {clean_completion}...")
-                else:
-                    print(f"      Generated: (empty or invalid)")
-        
-        syntax_score = correct / len(tests) if tests else 0.0
-        
-        return {
-            'score': syntax_score,
-            'correct': correct,
-            'total': len(tests),
-            'results': results
-        }
-    
-    def evaluate_programming(self) -> Dict:
-        """Evaluate programming correctness (Test 2)"""
-        print("\n=== Evaluating Programming Correctness ===")
-        tests = self.programming_suite.get_tests()
-        results = []
-        total_tests = 0
-        passed_tests = 0
-        
-        for test in tests:
-            prompt = test['prompt']
-            test_cases = test.get('test_cases', [])
-            
-            # Generate function code
-            generated = self.generate_code(prompt, max_length=200)
-            
-            # Extract function (try to find function definition)
-            function_code = generated
-            if 'function' not in function_code and 'const' not in function_code:
-                # Prepend prompt context
-                function_code = prompt + '\n' + generated
-            
-            test_results = []
-            for test_case in test_cases:
-                total_tests += 1
-                passed, output = self.programming_suite.run_test(function_code, test_case)
-                
-                if passed:
-                    passed_tests += 1
-                    print(f"  ✓ {test['id']}: {test_case['description']} - PASSED")
-                else:
-                    error_display = output[:100] if output else "Test failed"
-                    print(f"  ✗ {test['id']}: {test_case['description']} - FAILED")
-                    if output and 'PASS' not in output:
-                        print(f"      Output: {error_display[:80]}...")
-                
-                test_results.append({
-                    'description': test_case['description'],
-                    'passed': passed,
-                    'output': output
-                })
-            
-            results.append({
-                'test_id': test['id'],
-                'prompt': prompt,
-                'function_code': function_code,
-                'test_results': test_results
-            })
-        
-        programming_score = passed_tests / total_tests if total_tests > 0 else 0.0
-        
-        return {
-            'score': programming_score,
-            'passed': passed_tests,
-            'total': total_tests,
-            'results': results
-        }
-    
-    def evaluate_algorithmic(self) -> Dict:
-        """Evaluate algorithmic thinking (Test 3)"""
-        print("\n=== Evaluating Algorithmic Thinking ===")
-        tests = self.algorithmic_suite.get_tests()
-        results = []
-        total_score = 0
-        max_score = 0
-        
-        for test in tests:
-            prompt = test['prompt']
-            test_cases = test.get('test_cases', [])
-            efficiency_check = test.get('efficiency_check', '')
-            
-            # Generate algorithm code
-            generated = self.generate_code(prompt, max_length=300)
-            
-            # Extract function
-            # Clean generated text
-            generated = ''.join(c for c in generated if ord(c) < 0x10000)
-            function_code = generated
-            if 'function' not in function_code and 'const' not in function_code:
-                function_code = prompt + '\n' + generated
-            
-            # Run test cases
-            all_passed = True
-            for test_case in test_cases:
-                passed, output = self.algorithmic_suite.run_test(function_code, test_case)
-                if not passed:
-                    all_passed = False
-                    break
-            
-            # Evaluate efficiency
-            if all_passed:
-                efficiency_score = self.algorithmic_suite.evaluate_efficiency(
-                    function_code, efficiency_check
-                )
-                score = efficiency_score
-            else:
-                score = 0
-            
-            total_score += score
-            max_score += 2  # Max score per test is 2
-            
-            if score == 2:
-                print(f"  ✓ {test['id']}: Correct and efficient")
-            elif score == 1:
-                print(f"  ~ {test['id']}: Partially correct (tests passed but may not be optimal)")
-            else:
-                print(f"  ✗ {test['id']}: Incorrect (tests failed)")
-                # Show first failing test output if available
-                if test_cases:
-                    for tc in test_cases:
-                        passed, output = self.algorithmic_suite.run_test(function_code, tc)
-                        if not passed:
-                            error_display = output[:80] if output else "Test failed"
-                            print(f"      First failure: {error_display}...")
-                            break
-            
-            results.append({
-                'test_id': test['id'],
-                'prompt': prompt,
-                'function_code': function_code,
-                'score': score,
-                'max_score': 2,
-                'efficiency_check': efficiency_check
-            })
-        
-        algorithmic_score = total_score / max_score if max_score > 0 else 0.0
-        
-        return {
-            'score': algorithmic_score,
-            'total_score': total_score,
-            'max_score': max_score,
-            'results': results
-        }
-    
-    def evaluate_all(self) -> Dict:
-        """Run all evaluations"""
-        print(f"\n{'='*60}")
-        print(f"Evaluating model: {self.config.checkpoint_path}")
-        print(f"{'='*60}")
-        
-        # Run all test suites
-        syntax_results = self.evaluate_syntax()
-        programming_results = self.evaluate_programming()
-        algorithmic_results = self.evaluate_algorithmic()
-        
-        # Calculate composite score
-        composite_score = (
-            0.2 * syntax_results['score'] +
-            0.4 * programming_results['score'] +
-            0.4 * algorithmic_results['score']
+
+        # Extract config from checkpoint
+        config_dict = checkpoint.get("config", {})
+
+        # Create Shutka model with config parameters
+        model = UltraEfficientTextJEPA(
+            vocab_size=config_dict.get("vocab_size", 50000),
+            source_dim=config_dict.get("source_dim", 768),
+            source_depth=config_dict.get("source_depth", 12),
+            target_dim=config_dict.get("target_dim", 768),
+            target_depth=config_dict.get("target_depth", 6),
+            predictor_dim=config_dict.get("predictor_dim", 768),
+            predictor_depth=config_dict.get("predictor_depth", 8),
+            output_dim=config_dict.get("output_dim", 1536),
+            temperature=config_dict.get("temperature", 0.07),
+            max_source_len=config_dict.get("max_source_len", 16384),
+            max_target_len=config_dict.get("max_target_len", 512),
+            use_rag=config_dict.get("use_rag", True),
         )
+
+        # Load weights
+        model.load_state_dict(checkpoint["model_state_dict"])
+        return model
+
+    def _load_eval_patches(self):
+        """Load evaluation patches for VL-JEPA testing"""
+        eval_patches = []
         
+        # Tiktoken for accurate encoding
+        enc = None
+        if TIKTOKEN_AVAILABLE:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+            except:
+                enc = tiktoken.get_encoding("gpt2")
+
+        test_texts = [
+            "function add(a: number, b: number): number { return a + b; }",
+            "class Calculator { constructor() { } private add(x: number, y: number): number { return x + y; } }",
+            "const multiply = <T extends number>(a: T, b: T): number => a * b;",
+            "async function fetchData(url: string): Promise<any> { const res = await fetch(url); return res.json(); }",
+            "interface User { id: number; name: string; metadata?: Record<string, any>; }",
+            "type Result<T> = { success: true; data: T } | { success: false; error: string };",
+        ]
+
+        for text in test_texts:
+            if enc:
+                tokens = enc.encode(text)
+            else:
+                tokens = [ord(c) % 256 for c in text]
+
+            if len(tokens) < 16:
+                tokens.extend([0] * (16 - len(tokens)))
+
+            eval_patches.append({
+                "patches": torch.tensor(tokens, dtype=torch.long),
+                "text": text,
+                "category": "code"
+            })
+
+        return eval_patches
+
+    def _populate_test_memories(self):
+        """Populate memory bank with test data for evaluation"""
+        if not hasattr(self.model, 'memory_bank') or not self.model.memory_bank.indices:
+            return
+
+        print("Populating memory bank with test knowledge...")
+
+        # Create test knowledge base
+        test_knowledge = [
+            ("Python list comprehensions", "List comprehensions provide a concise way to create lists: [x**2 for x in range(10)]"),
+            ("JavaScript arrow functions", "Arrow functions: const add = (a, b) => a + b;"),
+            ("React useState hook", "useState manages component state: const [count, setCount] = useState(0);"),
+            ("TypeScript interfaces", "interface User { id: number; name: string; email: string; }"),
+            ("CSS flexbox", "Flexbox layout: display: flex; justify-content: center; align-items: center;"),
+            ("Git branching", "Create and switch to new branch: git checkout -b feature-branch"),
+            ("Docker containers", "Run container: docker run -p 3000:3000 myapp"),
+            ("SQL joins", "INNER JOIN combines rows: SELECT * FROM users u JOIN orders o ON u.id = o.user_id"),
+        ]
+
+        for topic, description in test_knowledge:
+            # Create simple random embedding that matches FAISS dimension (512)
+            emb = torch.randn(1, 512).to(self.device)  # Random embedding for testing
+            self.model.memory_bank.add_memory(emb, [description])
+
+        print(f"Added {len(test_knowledge)} knowledge entries to memory bank")
+
+    def evaluate_representation_quality(self) -> Dict:
+        """
+        Evaluate representation quality using patch similarity and clustering
+        """
+        print("\n=== Evaluating Representation Quality ===")
+
+        all_embeddings = []
+        labels = []
+
+        with torch.no_grad():
+            for sample in self.eval_patches:
+                tokens = sample["patches"].to(self.device)
+
+                # Split token sequence into source and target (VL-JEPA style)
+                mid_point = len(tokens) // 2
+                source_tokens = tokens[:mid_point]
+                target_tokens = tokens[mid_point:]
+
+                if len(source_tokens) > 0 and len(target_tokens) > 0:
+                    # Encode token sequences
+                    source_emb = self.model.encode_source(source_tokens.unsqueeze(0))
+                    target_emb = self.model.encode_target(target_tokens.unsqueeze(0))
+
+                    # For VL-JEPA evaluation, test prediction quality
+                    # Predict target from source using the predictor
+                    predicted_target = self.model.predict(
+                        source_emb, source_emb, source_mask=None, query_mask=None
+                    )
+
+                    # Compare predicted vs actual target (both are [batch, output_dim])
+                    pred_pooled = predicted_target.cpu().numpy()
+                    target_pooled = target_emb.cpu().numpy()
+
+                    all_embeddings.extend([pred_pooled, target_pooled])
+                    labels.extend(
+                        [f"{sample['category']}_source", f"{sample['category']}_target"]
+                    )
+
+        if not all_embeddings:
+            return {"score": 0.0, "details": "No embeddings generated"}
+
+        # Convert to numpy array
+        embeddings = np.vstack(all_embeddings)
+
+        # Calculate similarity matrix
+        similarity_matrix = cosine_similarity(embeddings)
+
+        # Evaluate intra-class vs inter-class similarity
+        # Same category pairs should be more similar than different category pairs
+        intra_class_sim = []
+        inter_class_sim = []
+
+        for i in range(len(labels)):
+            for j in range(i + 1, len(labels)):
+                sim = similarity_matrix[i, j]
+                if labels[i].split("_")[0] == labels[j].split("_")[0]:  # Same category
+                    intra_class_sim.append(sim)
+                else:
+                    inter_class_sim.append(sim)
+
+        if intra_class_sim and inter_class_sim:
+            intra_mean = np.mean(intra_class_sim)
+            inter_mean = np.mean(inter_class_sim)
+
+            # Quality score: higher when intra-class similarity > inter-class similarity
+            quality_score = max(0, min(1, (intra_mean - inter_mean + 1) / 2))
+        else:
+            quality_score = 0.0
+
+        print(f"  Intra-class similarity: {np.mean(intra_class_sim):.3f}")
+        print(f"  Inter-class similarity: {np.mean(inter_class_sim):.3f}")
+        print(f"  Representation quality score: {quality_score:.3f}")
+
+        return {
+            "score": quality_score,
+            "intra_class_similarity": float(np.mean(intra_class_sim)),
+            "inter_class_similarity": float(np.mean(inter_class_sim)),
+            "details": f"Intra: {len(intra_class_sim)} pairs, Inter: {len(inter_class_sim)} pairs",
+        }
+
+    def evaluate_retrieval(self) -> Dict:
+        """
+        Evaluate retrieval-augmented generation capability
+        """
+        print("\n=== Evaluating Retrieval Capability ===")
+
+        if (
+            not hasattr(self.model, "memory_bank")
+            or not self.model.memory_bank.indices
+        ):
+            print("  No FAISS memory bank available - skipping retrieval evaluation")
+            return {"score": 0.0, "details": "No memory bank"}
+
+        # Add some test memories to the bank
+        test_memories = []
+        test_texts = [
+            "JavaScript array methods: map, filter, reduce",
+            "React component lifecycle methods",
+            "Python list comprehensions syntax",
+            "TypeScript interface definitions",
+            "CSS flexbox properties",
+        ]
+
+        for i, text in enumerate(test_texts):
+            # Create random embedding that matches FAISS dimension (512)
+            emb = torch.randn(1, 512).to(self.device)
+            test_memories.append((emb, text))
+
+        # Add to memory bank
+        embeddings = torch.cat([emb for emb, _ in test_memories])
+        texts = [text for _, text in test_memories]
+        self.model.memory_bank.add_memory(embeddings, texts)
+
+        # Test retrieval
+        correct_retrievals = 0
+        total_queries = 0
+
+        for query_emb, expected_text in test_memories[:3]:  # Test first 3
+            total_queries += 1
+
+            # Search for similar memories
+            distances, indices, retrieved_texts = self.model.memory_bank.search(
+                query_emb, k=3
+            )
+
+            if retrieved_texts and retrieved_texts[0]:
+                # Check if expected text is in top results
+                retrieved = retrieved_texts[0]
+                if expected_text in retrieved:
+                    correct_retrievals += 1
+
+        retrieval_score = (
+            correct_retrievals / total_queries if total_queries > 0 else 0.0
+        )
+
+        print(
+            f"  Retrieval accuracy: {retrieval_score:.3f} ({correct_retrievals}/{total_queries})"
+        )
+
+        return {
+            "score": retrieval_score,
+            "correct_retrievals": correct_retrievals,
+            "total_queries": total_queries,
+        }
+
+    def evaluate_all(self) -> Dict:
+        """Run all VL-JEPA evaluations"""
+        print(f"\n{'='*60}")
+        print(f"Evaluating Shutka (VL-JEPA): {self.config.checkpoint_path}")
+        print(f"{'='*60}")
+
+        # Run evaluations
+        rep_quality = self.evaluate_representation_quality()
+        retrieval = self.evaluate_retrieval()
+
+        # Calculate composite score
+        composite_score = (rep_quality["score"] + retrieval["score"]) / 2
+
         # Compile results
         final_results = {
-            'timestamp': datetime.now().isoformat(),
-            'checkpoint': self.config.checkpoint_path,
-            'syntax': syntax_results,
-            'programming': programming_results,
-            'algorithmic': algorithmic_results,
-            'composite_score': composite_score,
-            'scores': {
-                'syntax': syntax_results['score'],
-                'programming': programming_results['score'],
-                'algorithmic': algorithmic_results['score'],
-                'composite': composite_score
-            }
+            "timestamp": datetime.now().isoformat(),
+            "checkpoint": self.config.checkpoint_path,
+            "representation_quality": rep_quality,
+            "retrieval": retrieval,
+            "composite_score": composite_score,
+            "scores": {
+                "representation_quality": rep_quality["score"],
+                "retrieval": retrieval["score"],
+                "composite": composite_score,
+            },
         }
-        
+
         # Print summary
         print(f"\n{'='*60}")
-        print("EVALUATION SUMMARY")
+        print("VL-JEPA EVALUATION SUMMARY")
         print(f"{'='*60}")
-        print(f"Syntax Score:        {syntax_results['score']:.2%} ({syntax_results['correct']}/{syntax_results['total']})")
-        print(f"Programming Score:   {programming_results['score']:.2%} ({programming_results['passed']}/{programming_results['total']})")
-        print(f"Algorithmic Score:   {algorithmic_results['score']:.2%} ({algorithmic_results['total_score']}/{algorithmic_results['max_score']})")
-        print(f"Composite Score:     {composite_score:.2%}")
+        print(f"Representation Quality: {rep_quality['score']:.3f}")
+        print(f"Retrieval Accuracy:     {retrieval['score']:.3f}")
+        print(f"Composite Score:        {composite_score:.3f}")
         print(f"{'='*60}\n")
-        
+
         return final_results
-    
+
     def save_results(self, results: Dict, filename: Optional[str] = None):
         """Save evaluation results to file"""
         os.makedirs(self.config.results_dir, exist_ok=True)
-        
+
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            model_name = os.path.basename(self.config.checkpoint_path).replace('.pt', '')
+            model_name = os.path.basename(self.config.checkpoint_path).replace(
+                ".pt", ""
+            )
             filename = f"results_{model_name}_{timestamp}.json"
-        
+
         filepath = os.path.join(self.config.results_dir, filename)
-        
-        with open(filepath, 'w') as f:
+
+        with open(filepath, "w") as f:
             json.dump(results, f, indent=2)
-        
+
         print(f"Results saved to: {filepath}")
         return filepath

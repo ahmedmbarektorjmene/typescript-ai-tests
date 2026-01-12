@@ -216,29 +216,29 @@ if (!passed) {{
                 ['bun', 'run', temp_path],
                 capture_output=True,
                 text=True,
-                timeout=1000
+                timeout=5
             )
             
             if result.returncode == 0 and 'PASS' in result.stdout:
                 return True, result.stdout
             else:
+                # If bun failed but exists, return its output
                 return False, result.stderr or result.stdout
         except FileNotFoundError:
-            # bun not available, try node with ts-node or tsx
+            # bun not available, try nodes/tsx
             try:
                 result = subprocess.run(
-                    ['bunx', 'tsx', temp_path],
+                    ['bunx', '--bun', 'tsx', temp_path],
                     capture_output=True,
                     text=True,
-                    timeout=1000
+                    timeout=5
                 )
                 if result.returncode == 0 and 'PASS' in result.stdout:
                     return True, result.stdout
                 else:
                     return False, result.stderr or result.stdout
             except:
-                # Fallback: return False if no runtime available
-                return False, "No TypeScript runtime available (bun/tsx)"
+                return False, "No TypeScript runtime available (bun required)"
         except Exception as e:
             return False, str(e)
         finally:

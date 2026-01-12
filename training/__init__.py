@@ -1,4 +1,4 @@
 from .trainer import Trainer
-from .data_loader import CodeDataset, create_dataloader
+from .data_loader import VLEPADataset, create_dataloader
 
-__all__ = ['Trainer', 'CodeDataset', 'create_dataloader']
+__all__ = ['Trainer', 'VLEPADataset', 'create_dataloader']

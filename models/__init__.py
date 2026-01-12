@@ -1,3 +1,3 @@
-from .mamba2 import Mamba2Model
+from .shutka import UltraEfficientTextJEPA
 
-__all__ = ['Mamba2Model']
+__all__ = ['UltraEfficientTextJEPA']
