@@ -176,8 +176,10 @@ class QuantizedLinear(nn.Module):
             self.linear = BitLinear(in_features, out_features, bias=bias)
 
     def forward(self, x):
-        if hasattr(self.linear, 'weight'):
-            x = x.to(self.linear.weight.dtype)
+        # bitsandbytes 8-bit layers require half-precision inputs on GPU.
+        # We explicitly cast to float16 to avoid MatMul8bitLt casting warnings.
+        if BITSANDBYTES_AVAILABLE and isinstance(self.linear, bnb.nn.Linear8bitLt):
+             x = x.to(torch.float16)
         return self.linear(x)
 
 
