@@ -436,6 +436,7 @@ class FAISSMemoryBank:
                 self.next_id = max(self.next_id, max(self.shard_memories[-1].keys()) + 1)
         
 
+    @torch.compiler.disable
     def add_memory(self, embeddings, texts):
         """Add new embeddings and return their IDs"""
         if not self.indices: 
@@ -496,6 +497,7 @@ class FAISSMemoryBank:
         # Let's just follow the delete + add workflow for simplicity.
         return self.add_memory(new_embedding, new_text)
 
+    @torch.compiler.disable
     def search(self, query_embeddings, k=5):
         if not self.indices: return None, None, []
         

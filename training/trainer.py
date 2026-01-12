@@ -80,8 +80,17 @@ class Trainer:
         
         # Setup mixed precision
         if self.use_mixed_precision:
-            self.scaler = torch.cuda.amp.GradScaler()
-            self.autocast_dtype = torch.bfloat16 if BF16_SUPPORTED else torch.float16
+            # Modern GradScaler API
+            self.scaler = torch.amp.GradScaler('cuda')
+            
+            # Optimized Dtype: Tesla T4 (Turing) supports FP16 much better than BF16.
+            # BF16 compilation is often skipped on T4.
+            is_ampere_or_newer = CUDA_AVAILABLE and torch.cuda.get_device_capability(0)[0] >= 8
+            if BF16_SUPPORTED and is_ampere_or_newer:
+                self.autocast_dtype = torch.bfloat16
+            else:
+                self.autocast_dtype = torch.float16
+                
             print(f"  Mixed precision: {self.autocast_dtype}")
         else:
             self.scaler = None
