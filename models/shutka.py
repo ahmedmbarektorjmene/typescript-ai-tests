@@ -631,8 +631,12 @@ class EfficientPredictor(nn.Module):
                         if len(texts[b]) > 1:
                             toks = json.loads(texts[b][1])
                             batch_neg_tokens.append(torch.tensor(toks, device=source_tokens.device))
+                        else:
+                            # Consistent batch size: add dummy if negative missing
+                            batch_neg_tokens.append(torch.zeros(1, dtype=torch.long, device=source_tokens.device))
                     except:
                         batch_rag_tokens.append(torch.zeros(1, dtype=torch.long, device=source_tokens.device))
+                        batch_neg_tokens.append(torch.zeros(1, dtype=torch.long, device=source_tokens.device))
 
                 max_len = max([t.size(0) for t in batch_rag_tokens])
                 padded_rag = torch.stack([F.pad(t, (0, max_len - t.size(0))) for t in batch_rag_tokens])
