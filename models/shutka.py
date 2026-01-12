@@ -47,32 +47,28 @@ class SwiGLU(nn.Module):
         return x * F.silu(gate)
 
 def precompute_rope_freqs(dim: int, seq_len: int, theta: float = 10000.0):
-    """Precompute frequency constants for RoPE"""
+    """Precompute frequency constants for RoPE (Real-valued for compiler)"""
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
     t = torch.arange(seq_len).float()
-    freqs = torch.outer(t, inv_freq)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    freqs = torch.outer(t, inv_freq) # (seq_len, dim/2)
+    return torch.cos(freqs), torch.sin(freqs)
 
-def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor):
-    """Apply Rotary Positional Embeddings to a tensor"""
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Apply Rotary Positional Embeddings using real-valued rotation matrix"""
     # x shape: (B, N, H, D)
     B, N, H, D = x.shape
-    x_complex = torch.view_as_complex(x.float().reshape(B, N, H, -1, 2))
     
-    # Slice/Pad to current sequence length
-    if N > freqs_cis.shape[0]:
-        # Extension: repeat last freq or pad (better than crashing)
-        padding = freqs_cis[-1:].repeat(N - freqs_cis.shape[0], 1)
-        freqs_cis = torch.cat([freqs_cis, padding], dim=0)
-    else:
-        freqs_cis = freqs_cis[:N]
+    # cos/sin shape: (seq_len, D/2)
+    # Target shape for broadcast: (1, N, 1, D)
+    cos = cos[:N].to(device=x.device, dtype=x.dtype).repeat_interleave(2, dim=-1).view(1, N, 1, D)
+    sin = sin[:N].to(device=x.device, dtype=x.dtype).repeat_interleave(2, dim=-1).view(1, N, 1, D)
     
-    # Reshape for broadcasting: (1, N, 1, -1)
-    freqs_cis = freqs_cis.to(x.device).view(1, N, 1, -1)
+    # Rotation logic: [x0, x1, x2, x3] -> [-x1, x0, -x3, x2] for sin multiplication
+    x_half = x.reshape(B, N, H, D // 2, 2)
+    x_rotated = torch.stack([-x_half[..., 1], x_half[..., 0]], dim=-1).reshape(B, N, H, D)
     
-    # Apply and reshape back
-    x_out = torch.view_as_real(x_complex * freqs_cis).reshape(B, N, H, D)
-    return x_out.type_as(x)
+    return x * cos + x_rotated * sin
+
 
 # ============================================================================
 # BITLINEAR 1.58b - TERNARY WEIGHT LAYER
@@ -216,7 +212,7 @@ class FlashLinearAttention(nn.Module):
         self.proj = QuantizedLinear(dim, dim)
         self.norm = RMSNorm(dim)
 
-    def forward(self, x, freqs_cis=None, mask=None):
+    def forward(self, x, cos=None, sin=None, mask=None):
         B, N, C = x.shape
         
         # 1. Project Q, K, V
@@ -224,11 +220,9 @@ class FlashLinearAttention(nn.Module):
         q, k, v = qkv.unbind(2) # (B, N, H, D)
 
         # 1.5 Apply RoPE if freqs are provided
-        if freqs_cis is not None:
-            # We need to squeeze head dim if apply_rope expects (B, N, D)
-            # or handle multiple heads. Standard apply_rope handles heads if we reshape.
-            q = apply_rope(q, freqs_cis)
-            k = apply_rope(k, freqs_cis)
+        if cos is not None and sin is not None:
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
         
         # 2. Compute Gate (Decay rate) similar to Mamba/RWKV
         # Determines how much info to keep from previous chunks
@@ -340,8 +334,8 @@ class EfficientTransformerBlock(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = EfficientMLP(dim, int(dim * mlp_ratio), dropout)
 
-    def forward(self, x, freqs_cis=None, mask=None):
-        x = x + self.attn(self.norm1(x), freqs_cis, mask)
+    def forward(self, x, cos=None, sin=None, mask=None):
+        x = x + self.attn(self.norm1(x), cos, sin, mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -400,8 +394,8 @@ class FAISSMemoryBank:
                         print(f"  Using IVFFlat index for shard {shard_id}")
                     
                     # Training is REQUIRED for IVF/PQ
-                    # We use a mock train with 1000 vectors
-                    train_data = np.random.normal(0, 1, (2000, dimension)).astype('float32')
+                    # We use a mock train with 10,000 vectors to satisfy clustering requirements
+                    train_data = np.random.normal(0, 1, (10000, dimension)).astype('float32')
                     faiss.normalize_L2(train_data)
                     index.train(train_data)
                     index.nprobe = 10
@@ -562,15 +556,14 @@ class EfficientXEncoder(nn.Module):
             [EfficientTransformerBlock(d_model, num_heads) for _ in range(depth)]
         )
         self.norm = RMSNorm(d_model)
-        self.freqs_cis = precompute_rope_freqs(d_model // num_heads, max_seq_len)
+        self.cos, self.sin = precompute_rope_freqs(d_model // num_heads, max_seq_len)
 
     def forward(self, x, attention_mask=None):
         B, L = x.shape
         x = self.token_embed(x)
-        # RoPE handles positional information within the attention blocks
         
         for block in self.blocks:
-            x = block(x, freqs_cis=self.freqs_cis[:L], mask=attention_mask)
+            x = block(x, cos=self.cos[:L], sin=self.sin[:L], mask=attention_mask)
         return self.norm(x)
         
 class EfficientYEncoder(nn.Module):
@@ -582,13 +575,13 @@ class EfficientYEncoder(nn.Module):
             [EfficientTransformerBlock(d_model, num_heads) for _ in range(depth)]
         )
         self.norm = RMSNorm(d_model)
-        self.freqs_cis = precompute_rope_freqs(d_model // num_heads, max_seq_len)
+        self.cos, self.sin = precompute_rope_freqs(d_model // num_heads, max_seq_len)
 
     def forward(self, x, attention_mask=None):
         B, L = x.shape
         x = self.token_embed(x)
         for block in self.blocks:
-            x = block(x, freqs_cis=self.freqs_cis[:L], mask=attention_mask)
+            x = block(x, cos=self.cos[:L], sin=self.sin[:L], mask=attention_mask)
         return self.norm(x).mean(dim=1)
 
 class EfficientPredictor(nn.Module):
@@ -605,7 +598,7 @@ class EfficientPredictor(nn.Module):
         )
         self.norm = RMSNorm(predictor_dim)
         self.output_proj = QuantizedLinear(predictor_dim, output_dim)
-        self.freqs_cis = precompute_rope_freqs(predictor_dim // num_heads, max_seq_len)
+        self.cos, self.sin = precompute_rope_freqs(predictor_dim // num_heads, max_seq_len)
 
     def forward(self, source_tokens, query_tokens, source_mask=None, query_mask=None):
         source_emb = self.source_proj(source_tokens)
@@ -657,7 +650,7 @@ class EfficientPredictor(nn.Module):
         L = x.shape[1]
         
         for block in self.blocks:
-            x = block(x, freqs_cis=self.freqs_cis[:L])
+            x = block(x, cos=self.cos[:L], sin=self.sin[:L])
         
         return self.output_proj(self.norm(x).mean(dim=1)), rag_negatives
 
