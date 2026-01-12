@@ -384,13 +384,36 @@ class FAISSMemoryBank:
                     index = faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
                     
                     # FAISS OnDiskInvertedLists are read-only by default when mmapped.
-                    # We must explicitly set read_only=False to allow incremental updates.
+                    # We must explicitly set read_only=False on ALL levels to allow updates.
                     try:
-                        ivf_index = faiss.extract_index_ivf(index)
-                        if ivf_index:
-                            ivf_index.invlists.read_only = False
+                        curr = index
+                        found_ivf = False
+                        while curr:
+                            # 1. Try to extract IVF and set read_only on its invlists
+                            ivf = faiss.extract_index_ivf(curr)
+                            if ivf and hasattr(ivf, 'invlists'):
+                                try:
+                                    # Use downcast for maximum compatibility
+                                    invlists = faiss.downcast_InvertedLists(ivf.invlists)
+                                    invlists.read_only = False
+                                    found_ivf = True
+                                except:
+                                    ivf.invlists.read_only = False
+                                    found_ivf = True
+                            
+                            # 2. Recursively unwrap if it's an IDMap or similar
+                            if hasattr(curr, 'index'):
+                                curr = curr.index
+                            else:
+                                break
+                        
+                        if found_ivf:
+                            print(f"  Shard {shard_id}: Successfully made writable (IVF detected)")
+                        else:
+                            print(f"  Shard {shard_id}: Loaded as writable (no IVF/MMAP restrictions)")
+                            
                     except Exception as e:
-                        print(f"  Warning: Could not make shard {shard_id} writable: {e}")
+                        print(f"  Warning: Error making shard {shard_id} writable: {e}")
                     
                     self.indices.append(index)
                 else:
