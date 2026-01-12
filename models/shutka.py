@@ -380,41 +380,10 @@ class FAISSMemoryBank:
             index_path = os.path.join(base_dir, f"shard_{shard_id}.index")
             try:
                 if os.path.exists(index_path):
-                    # MMAP Loading: Critical for huge files
-                    index = faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
-                    
-                    # FAISS OnDiskInvertedLists are read-only by default when mmapped.
-                    # We must explicitly set read_only=False on ALL levels to allow updates.
-                    try:
-                        curr = index
-                        found_ivf = False
-                        while curr:
-                            # 1. Try to extract IVF and set read_only on its invlists
-                            ivf = faiss.extract_index_ivf(curr)
-                            if ivf and hasattr(ivf, 'invlists'):
-                                try:
-                                    # Use downcast for maximum compatibility
-                                    invlists = faiss.downcast_InvertedLists(ivf.invlists)
-                                    invlists.read_only = False
-                                    found_ivf = True
-                                except:
-                                    ivf.invlists.read_only = False
-                                    found_ivf = True
-                            
-                            # 2. Recursively unwrap if it's an IDMap or similar
-                            if hasattr(curr, 'index'):
-                                curr = curr.index
-                            else:
-                                break
-                        
-                        if found_ivf:
-                            print(f"  Shard {shard_id}: Successfully made writable (IVF detected)")
-                        else:
-                            print(f"  Shard {shard_id}: Loaded as writable (no IVF/MMAP restrictions)")
-                            
-                    except Exception as e:
-                        print(f"  Warning: Error making shard {shard_id} writable: {e}")
-                    
+                    # Standard Loading: Critical for stable incremental updates.
+                    # IO_FLAG_MMAP often loses the filename reference, causing truncate() to fail.
+                    index = faiss.read_index(index_path)
+                    print(f"  Shard {shard_id}: Loaded into memory")
                     self.indices.append(index)
                 else:
                     # Create coarse quantizer for IVF
