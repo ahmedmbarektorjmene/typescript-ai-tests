@@ -228,10 +228,16 @@ class Trainer:
                 # Mixed precision backward pass
                 self.scaler.scale(loss).backward()
                 
-                # SAFETY: GradScaler.unscale_ fails if it finds FP16 gradients.
+                # NUCLEAR SYNC: Fix dtype mismatches between parameters and gradients.
+                # bitsandbytes mutates weights to float16 during forward, but GradScaler
+                # produces float32 gradients. This causes a crash in the optimizer (assignment error).
+                # We synchronize everything back to float32 before unscaling/stepping.
                 for p in self.model.parameters():
-                    if p.grad is not None and p.grad.dtype == torch.float16:
-                         p.grad.data = p.grad.data.to(torch.float32)
+                    if p.grad is not None:
+                        if p.dtype == torch.float16 or p.grad.dtype == torch.float16:
+                            # Re-sync to float32 for optimizer compatibility
+                            p.data = p.data.to(torch.float32)
+                            p.grad.data = p.grad.data.to(torch.float32)
                 
                 # Gradient clipping with scaler
                 self.scaler.unscale_(self.optimizer)
