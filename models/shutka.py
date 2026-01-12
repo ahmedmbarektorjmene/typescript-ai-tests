@@ -6,6 +6,10 @@ import math
 import numpy as np
 import os
 import json
+import warnings
+
+# Suppress noisy bitsandbytes warnings that occur during quantization
+warnings.filterwarnings("ignore", message="MatMul8bitLt: inputs will be cast from.*")
 
 # Optional imports for production
 try:
@@ -177,10 +181,10 @@ class QuantizedLinear(nn.Module):
 
     @torch.compiler.disable
     def forward(self, x):
-        # bitsandbytes 8-bit layers require half-precision inputs on GPU.
-        # We explicitly cast to float16 to avoid MatMul8bitLt casting warnings.
-        if BITSANDBYTES_AVAILABLE and isinstance(self.linear, bnb.nn.Linear8bitLt):
-             x = x.to(torch.float16)
+        # We REVERTED the explicit cast to float16 because it triggers bitsandbytes
+        # to cast its bias weights to float16, which causes GradScaler to fail 
+        # (ValueError: Attempting to unscale FP16 gradients).
+        # The MatMul8bitLt warning is now handled by a global filter.
         return self.linear(x)
 
 

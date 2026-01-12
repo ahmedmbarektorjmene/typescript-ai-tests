@@ -102,7 +102,7 @@ class Trainer:
             self.model.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
-            fused=CUDA_AVAILABLE  # Fused optimizer for GPU
+            fused=False  # Disabled: bitsandbytes mutations cause dtype mismatch for fused kernels on T4
         )
         
         # Learning rate scheduler
@@ -214,6 +214,15 @@ class Trainer:
                 # Mixed precision backward pass
                 self.scaler.scale(loss).backward()
                 
+                # SAFETY: GradScaler.unscale_ fails if it finds FP16 gradients.
+                # Some layers (like bitsandbytes) might mutate parameters to FP16.
+                # We cast BOTH the parameter and the gradient back to FP32 to ensure
+                # consistency for the optimizer and the scaler.
+                for p in self.model.parameters():
+                    if p.grad is not None and (p.grad.dtype == torch.float16 or p.dtype == torch.float16):
+                         p.data = p.data.to(torch.float32)
+                         p.grad.data = p.grad.data.to(torch.float32)
+                
                 # Gradient clipping with scaler
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -223,10 +232,9 @@ class Trainer:
                 if has_nan_grad:
                     print(f"\nWarning: NaN/Inf gradients at step {self.global_step}. Skipping update.")
                     self.optimizer.zero_grad(set_to_none=True)
-                    continue
+                else:
+                    self.scaler.step(self.optimizer)
                 
-                # Optimizer step with scaler
-                self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 # Standard precision forward pass (CPU or explicit disable)
