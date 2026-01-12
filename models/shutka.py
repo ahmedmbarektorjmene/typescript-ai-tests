@@ -1,52 +1,77 @@
 import torch
-
 import torch.nn as nn
-
 import torch.nn.functional as F
-
-from typing import Optional, Tuple, List
-
+from typing import Optional, Tuple, List, Dict
 import math
-
 import numpy as np
-
 import os
-
 import json
 
-
 # Optional imports for production
-
 try:
-
     import faiss
-
     FAISS_AVAILABLE = True
-
 except ImportError:
-
     FAISS_AVAILABLE = False
-
     print("Warning: FAISS not available. Install with: pip install faiss-cpu")
 
-
 try:
-
     import bitsandbytes as bnb
-
     BITSANDBYTES_AVAILABLE = True
-
 except ImportError:
-
     BITSANDBYTES_AVAILABLE = False
-
     print("Info: bitsandbytes not available. Using custom quantization.")
 
-
+# ============================================================================
+# MODERN TRANSFORMER COMPONENTS (RMSNorm, SwiGLU, RoPE)
 # ============================================================================
 
-# BITLINEAR 1.58b - TERNARY WEIGHT LAYER
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (faster than LayerNorm)"""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+class SwiGLU(nn.Module):
+    """Swish-Gated Linear Unit activation"""
+    def forward(self, x):
+        x, gate = x.chunk(2, dim=-1)
+        return x * F.silu(gate)
+
+def precompute_rope_freqs(dim: int, seq_len: int, theta: float = 10000.0):
+    """Precompute frequency constants for RoPE"""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(seq_len).float()
+    freqs = torch.outer(t, inv_freq)
+    return torch.polar(torch.ones_like(freqs), freqs)
+
+def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor):
+    """Apply Rotary Positional Embeddings to a tensor"""
+    # x shape: (B, N, H, D)
+    B, N, H, D = x.shape
+    x_complex = torch.view_as_complex(x.float().reshape(B, N, H, -1, 2))
+    
+    # freqs_cis shape: (N_max, D_half)
+    # Slice to current sequence length
+    freqs_cis = freqs_cis.to(x.device)[:N]
+    
+    # Reshape for broadcasting: (1, N, 1, D_half)
+    freqs_cis = freqs_cis.view(1, N, 1, -1)
+    
+    # Apply and reshape back
+    x_out = torch.view_as_real(x_complex * freqs_cis).reshape(B, N, H, D)
+    return x_out.type_as(x)
+
+# ============================================================================
+# BITLINEAR 1.58b - TERNARY WEIGHT LAYER
 # ============================================================================
 
 
@@ -183,16 +208,23 @@ class FlashLinearAttention(nn.Module):
         
         # Projections
         self.qkv = QuantizedLinear(dim, dim * 3)
-        self.gate = QuantizedLinear(dim, dim) # Data-dependent decay rate (like Mamba)
+        self.gate = QuantizedLinear(dim, dim)
         self.proj = QuantizedLinear(dim, dim)
-        self.norm = nn.LayerNorm(dim)
+        self.norm = RMSNorm(dim)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, freqs_cis=None, mask=None):
         B, N, C = x.shape
         
         # 1. Project Q, K, V
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2) # (B, N, H, D)
+
+        # 1.5 Apply RoPE if freqs are provided
+        if freqs_cis is not None:
+            # We need to squeeze head dim if apply_rope expects (B, N, D)
+            # or handle multiple heads. Standard apply_rope handles heads if we reshape.
+            q = apply_rope(q, freqs_cis)
+            k = apply_rope(k, freqs_cis)
         
         # 2. Compute Gate (Decay rate) similar to Mamba/RWKV
         # Determines how much info to keep from previous chunks
@@ -268,17 +300,14 @@ class EfficientMLP(nn.Module):
     """MLP with quantized layers"""
 
     def __init__(self, dim, hidden_dim=None, dropout=0.0):
-
         super().__init__()
-
-        hidden_dim = hidden_dim or dim * 4
-
-        self.fc1 = QuantizedLinear(dim, hidden_dim)
-
-        self.act = nn.GELU()
-
+        # SwiGLU typically uses a smaller hidden dim multiplier (2/3 of 4x)
+        hidden_dim = hidden_dim or int(2 * dim * 4 / 3)
+        hidden_dim = (hidden_dim + 7) // 8 * 8  # Multiple of 8
+        
+        self.fc1 = QuantizedLinear(dim, hidden_dim * 2) # Doubled for SwiGLU gating
+        self.act = SwiGLU()
         self.fc2 = QuantizedLinear(hidden_dim, dim)
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -302,13 +331,13 @@ class EfficientTransformerBlock(nn.Module):
     """
     def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = RMSNorm(dim)
         self.attn = FlashLinearAttention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = RMSNorm(dim)
         self.mlp = EfficientMLP(dim, int(dim * mlp_ratio), dropout)
 
-    def forward(self, x, mask=None):
-        x = x + self.attn(self.norm1(x), mask)
+    def forward(self, x, freqs_cis=None, mask=None):
+        x = x + self.attn(self.norm1(x), freqs_cis, mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -347,16 +376,15 @@ class FAISSMemoryBank:
             try:
                 if os.path.exists(index_path):
                     # MMAP Loading: Critical for huge files
-                    # Read index without loading vector data to RAM
                     index = faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
                     self.indices.append(index)
                 else:
+                    # Create coarse quantizer for IVF
+                    quantizer = faiss.IndexFlatL2(dimension)
+                    
                     # Create new IVF index (Clustered) for scalability
-                    # Quantizer (Coarse quantizer)
                     if dimension % 8 == 0:
                         # IndexIVFPQ: Clustered + Product Quantization (Compression)
-                        # dimension // 8 = number of sub-quantizers (e.g. 768 / 8 = 96)
-                        # 8 = number of bits per sub-quantizer
                         index = faiss.IndexIVFPQ(quantizer, dimension, 100, dimension // 8, 8)
                         print(f"  Using compressed IVFPQ index for shard {shard_id}")
                     else:
@@ -472,24 +500,19 @@ class EfficientXEncoder(nn.Module):
     def __init__(self, vocab_size=50257, d_model=768, depth=12, num_heads=8, max_seq_len=4096):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
         self.blocks = nn.ModuleList(
             [EfficientTransformerBlock(d_model, num_heads) for _ in range(depth)]
         )
-        self.norm = nn.LayerNorm(d_model)
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        self.norm = RMSNorm(d_model)
+        self.freqs_cis = precompute_rope_freqs(d_model // num_heads, max_seq_len)
 
     def forward(self, x, attention_mask=None):
         B, L = x.shape
         x = self.token_embed(x)
-        # Handle position embedding size mismatch if L > max
-        if L <= self.pos_embed.shape[1]:
-            x = x + self.pos_embed[:, :L, :]
-        else:
-            x = x + self.pos_embed[:, :self.pos_embed.shape[1], :] # Just truncate pos for now
-            
+        # RoPE handles positional information within the attention blocks
+        
         for block in self.blocks:
-            x = block(x, mask=attention_mask)
+            x = block(x, freqs_cis=self.freqs_cis[:L], mask=attention_mask)
         return self.norm(x)
         
 class EfficientYEncoder(nn.Module):
@@ -497,22 +520,21 @@ class EfficientYEncoder(nn.Module):
     def __init__(self, vocab_size=50257, d_model=768, depth=6, num_heads=8, max_seq_len=512):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
         self.blocks = nn.ModuleList(
             [EfficientTransformerBlock(d_model, num_heads) for _ in range(depth)]
         )
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = RMSNorm(d_model)
+        self.freqs_cis = precompute_rope_freqs(d_model // num_heads, max_seq_len)
 
     def forward(self, x, attention_mask=None):
         B, L = x.shape
         x = self.token_embed(x)
-        x = x + self.pos_embed[:, :L, :]
         for block in self.blocks:
-            x = block(x, mask=attention_mask)
+            x = block(x, freqs_cis=self.freqs_cis[:L], mask=attention_mask)
         return self.norm(x).mean(dim=1)
 
 class EfficientPredictor(nn.Module):
-    def __init__(self, source_dim=768, target_dim=768, predictor_dim=768, depth=6, num_heads=8, output_dim=1536, use_rag=True, token_embed=None):
+    def __init__(self, source_dim=768, target_dim=768, predictor_dim=768, depth=6, num_heads=8, output_dim=1536, use_rag=True, token_embed=None, max_seq_len=8192):
         super().__init__()
         self.use_rag = use_rag and FAISS_AVAILABLE
         self.token_embed = token_embed
@@ -523,8 +545,9 @@ class EfficientPredictor(nn.Module):
         self.blocks = nn.ModuleList(
             [EfficientTransformerBlock(predictor_dim, num_heads) for _ in range(depth)]
         )
-        self.norm = nn.LayerNorm(predictor_dim)
+        self.norm = RMSNorm(predictor_dim)
         self.output_proj = QuantizedLinear(predictor_dim, output_dim)
+        self.freqs_cis = precompute_rope_freqs(predictor_dim // num_heads, max_seq_len)
 
     def forward(self, source_tokens, query_tokens, source_mask=None, query_mask=None):
         source_emb = self.source_proj(source_tokens)
@@ -537,50 +560,42 @@ class EfficientPredictor(nn.Module):
         if self.use_rag and hasattr(self, 'memory_bank') and self.memory_bank.indices:
             # Query using mean of source
             query_vec = source_emb.mean(dim=1)
-            d, i, texts = self.memory_bank.search(query_vec, k=2) # Get Top-1 (Context) + Top-2 (Negative)
+            d, i, texts = self.memory_bank.search(query_vec, k=2)
             
             if texts and self.token_embed is not None:
-                # Parse retrieved texts back to tokens
                 batch_rag_tokens = []
-                batch_neg_tokens = [] # List of tensors
+                batch_neg_tokens = []
                 
                 for b in range(len(texts)):
                     try:
-                        # Context
                         if len(texts[b]) > 0:
                             toks = json.loads(texts[b][0]) 
                             batch_rag_tokens.append(torch.tensor(toks, device=source_tokens.device))
                         else:
                              batch_rag_tokens.append(torch.zeros(1, dtype=torch.long, device=source_tokens.device))
                         
-                        # Negative
                         if len(texts[b]) > 1:
                             toks = json.loads(texts[b][1])
                             batch_neg_tokens.append(torch.tensor(toks, device=source_tokens.device))
                     except:
                         batch_rag_tokens.append(torch.zeros(1, dtype=torch.long, device=source_tokens.device))
 
-                # Process Context (same as before)
                 max_len = max([t.size(0) for t in batch_rag_tokens])
-                padded_rag = torch.stack([
-                    F.pad(t, (0, max_len - t.size(0))) for t in batch_rag_tokens
-                ])
+                padded_rag = torch.stack([F.pad(t, (0, max_len - t.size(0))) for t in batch_rag_tokens])
                 rag_emb = self.token_embed(padded_rag)
                 rag_context.append(rag_emb)
                 
-                # Process Negatives (prepare for return)
                 if batch_neg_tokens:
                     max_neg_len = max([t.size(0) for t in batch_neg_tokens])
-                    rag_negatives = torch.stack([
-                        F.pad(t, (0, max_neg_len - t.size(0))) for t in batch_neg_tokens
-                    ]) # (B, L_neg)
+                    rag_negatives = torch.stack([F.pad(t, (0, max_neg_len - t.size(0))) for t in batch_neg_tokens])
 
         # Concat context
         inputs = [source_emb, query_emb] + rag_context
         x = torch.cat(inputs, dim=1)
+        L = x.shape[1]
         
         for block in self.blocks:
-            x = block(x)
+            x = block(x, freqs_cis=self.freqs_cis[:L])
         
         return self.output_proj(self.norm(x).mean(dim=1)), rag_negatives
 
@@ -729,6 +744,10 @@ class UltraEfficientTextJEPA(nn.Module):
 
         self.y_decoder = EfficientYDecoder(output_dim, vocab_size)
 
+        # WEIGHT TYING: Tie input embeddings with output head
+        # This saves memory and improves semantic alignment
+        self.y_decoder.lm_head.weight = self.x_encoder.token_embed.weight
+
         self.loss_fn = InfoNCELoss(temperature)
 
         # Count parameters
@@ -768,8 +787,7 @@ class UltraEfficientTextJEPA(nn.Module):
         source_emb = self.encode_source(source_tokens, source_mask)
 
         query_emb = self.y_encoder.token_embed(query_tokens)
-
-        query_emb = query_emb + self.y_encoder.pos_embed[:, : query_tokens.shape[1], :]
+        # RoPE is applied to query_emb inside the predictor's attention blocks
 
         pred_emb, neg_tokens = self.predict(source_emb, query_emb, source_mask, query_mask)
 
