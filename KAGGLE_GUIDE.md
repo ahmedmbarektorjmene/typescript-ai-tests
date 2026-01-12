@@ -97,9 +97,14 @@ bank.update_memory(old_id, new_embeddings, ["interface User { id: number }"])
 
 ### Tip: Kaggle Output Persistence
 
-Remember, `/kaggle/working` is wiped after 12 hours of inactivity. Always download your `memory_bank/` directory using the ZIP utility at the end of your session.
+Remember, `/kaggle/working` is wiped after 12 hours of inactivity. Always download your `shutka_v2_bundle.zip` at the end of your session.
 
-```python
-import shutil
-shutil.make_archive('shutka_v2_bundle', 'zip', '/kaggle/working')
+## 8. Development: OpenAI API Mode
+
+To use your trained Kaggle model in your local IDE, download the checkpoint and run:
+
+```bash
+python api_server.py
 ```
+
+This starts a FastAPI server compatible with OpenAI's Chat, Completions, and Embeddings specs. Point **Cursor** or **VS Code** to `http://localhost:8000/v1` with model `shutka-v2`.

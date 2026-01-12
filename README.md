@@ -6,13 +6,11 @@ Shutka is a state-of-the-art **VL-JEPA** (Vision-Language Joint Embedding Predic
 
 Shutka V2 incorporates cutting-edge architectural advancements to provide a premium coding experience:
 
-- **VL-JEPA Paradigm**: Non-autoregressive representation learning using semantic patches rather than sequential token prediction.
-- **RMSNorm**: Faster, hardware-efficient normalization (as used in Llama-3 and Mistral).
-- **SwiGLU Activations**: Enhanced reasoning performance using Gated Linear Units.
-- **Rotary Positional Embeddings (RoPE)**: Dynamic, relative positional information for superior code understanding and extrapolation.
-- **BitLinear 1.58b**: Ternary weight quantization reducing memory usage by up to 16x.
-- **Flash Linear Attention**: Scalable $O(N)$ complexity for long context windows.
-- **Dynamic FAISS Memory (RAG)**: Mutable external memory bank with ID-based management (Add/Delete/Update).
+- **VL-JEPA Paradigm**: Non-autoregressive representation learning using semantic patches.
+- **Efficient Tokenizer (cl100k_base)**: Upgraded to 100k vocabulary for superior code compression and GPT-4 compatibility.
+- **RMSNorm & SwiGLU**: Modern, hardware-efficient architecture components.
+- **HTTP/2 Support**: Optimized API server for ultra-low latency streaming.
+- **Dynamic FAISS Memory (RAG)**: Mutable memory bank with live API-based context injection.
 
 ## 📂 Project Structure
 
@@ -67,17 +65,52 @@ bank.update_memory(old_id, new_embeddings, "New implementation...")
 
 ```bash
 # Optimized for Bun & Python 3.10+
-pip install faiss-cpu datasets tiktoken torch numpy tqdm
+pip install faiss-cpu datasets tiktoken torch numpy tqdm hypercorn h2
 ```
 
-## for GPU
+#### for GPU
 
 ```bash
 # Optimized for Bun & Python 3.10+
-pip install faiss-gpu datasets tiktoken torch numpy tqdm bitsandbytes
+pip install faiss-gpu datasets tiktoken torch numpy tqdm bitsandbytes fastapi hypercorn h2
 ```
 
-### 2. Recommended Training Sequence
+### 2. OpenAI-Compatible API
+
+Expose Shutka as a local server for **Cursor**, **VS Code**, or **Continue**:
+
+```bash
+python api_server.py
+```
+
+#### Recommended Configuration (continue)
+
+configure continue vscode extension settings:
+
+```yaml
+name: Local Config
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Shutka Local
+    provider: openai
+    model: shutka-v2
+    apiBase: http://localhost:8000/v1
+    apiKey: anything
+```
+
+### 4. Dynamic Context Injection
+
+You can "teach" Shutka new information on the fly using the specialized memory endpoint:
+
+```bash
+curl -X POST http://localhost:8000/v1/memory \
+     -H "Content-Type: application/json" \
+     -d '{"text": "The new project structure uses Bun for execution..."}'
+```
+
+### 3. Recommended Training Sequence
 
 To turn Shutka into a premium coding agent, we recommend a two-phase training approach:
 
@@ -97,7 +130,7 @@ Train the model to map natural language to code using real-world data.
 python training/train_real_data.py --resume checkpoints/best_model.pt --epochs 10
 ```
 
-### 3. Evaluation (Bun Optimized)
+### 4. Evaluation (Bun Optimized)
 
 ```bash
 # Verify syntax and programming logic

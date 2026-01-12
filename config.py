@@ -9,7 +9,7 @@ from typing import Optional
 class TrainingConfig:
     """Training configuration for Shutka (VL-JEPA with Flash Linear Attention)"""
     # Flash Linear Attention Architecture parameters
-    vocab_size: int = 50257   # Tiktoken (GPT-2) vocabulary size
+    vocab_size: int = 100277  # Modern OpenAI (cl100k_base) vocabulary size
     source_dim: int = 768     # Standard Base dimension
     source_depth: int = 12    # Deeper encoder for better semantics
     target_dim: int = 768     # Match source dim
@@ -34,7 +34,7 @@ class TrainingConfig:
     # Data parameters
     data_dir: str = "data"
     train_split: float = 0.9
-    tokenizer: str = "gpt2"      # Use tiktoken gpt2/cl100k_base
+    tokenizer: str = "cl100k_base" # Use the most efficient cl100k_base
 
     # RAG parameters (Huge Memory)
     use_rag: bool = True

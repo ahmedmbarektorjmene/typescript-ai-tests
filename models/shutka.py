@@ -59,12 +59,16 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor):
     B, N, H, D = x.shape
     x_complex = torch.view_as_complex(x.float().reshape(B, N, H, -1, 2))
     
-    # freqs_cis shape: (N_max, D_half)
-    # Slice to current sequence length
-    freqs_cis = freqs_cis.to(x.device)[:N]
+    # Slice/Pad to current sequence length
+    if N > freqs_cis.shape[0]:
+        # Extension: repeat last freq or pad (better than crashing)
+        padding = freqs_cis[-1:].repeat(N - freqs_cis.shape[0], 1)
+        freqs_cis = torch.cat([freqs_cis, padding], dim=0)
+    else:
+        freqs_cis = freqs_cis[:N]
     
-    # Reshape for broadcasting: (1, N, 1, D_half)
-    freqs_cis = freqs_cis.view(1, N, 1, -1)
+    # Reshape for broadcasting: (1, N, 1, -1)
+    freqs_cis = freqs_cis.to(x.device).view(1, N, 1, -1)
     
     # Apply and reshape back
     x_out = torch.view_as_real(x_complex * freqs_cis).reshape(B, N, H, D)
@@ -547,7 +551,7 @@ class FAISSMemoryBank:
 
 
 class EfficientXEncoder(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=768, depth=12, num_heads=8, max_seq_len=4096):
+    def __init__(self, vocab_size=100277, d_model=768, depth=12, num_heads=8, max_seq_len=4096):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.ModuleList(
@@ -567,7 +571,7 @@ class EfficientXEncoder(nn.Module):
         
 class EfficientYEncoder(nn.Module):
     """Efficient Y-Encoder with Flash Linear Attention"""
-    def __init__(self, vocab_size=50257, d_model=768, depth=6, num_heads=8, max_seq_len=512):
+    def __init__(self, vocab_size=100277, d_model=768, depth=6, num_heads=8, max_seq_len=512):
         super().__init__()
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.blocks = nn.ModuleList(
@@ -650,7 +654,7 @@ class EfficientPredictor(nn.Module):
         return self.output_proj(self.norm(x).mean(dim=1)), rag_negatives
 
 class EfficientYDecoder(nn.Module):
-    def __init__(self, d_model=1536, vocab_size=50257, num_layers=4):
+    def __init__(self, d_model=1536, vocab_size=100277, num_layers=4):
         super().__init__()
         self.embed_proj = QuantizedLinear(d_model, 768) # Project back to model dim
         self.blocks = nn.ModuleList(
