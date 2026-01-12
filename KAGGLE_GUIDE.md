@@ -7,7 +7,8 @@ This guide shows how to set up and run the training on a Kaggle Notebook (Single
 In a Kaggle cell:
 
 ```python
-!pip install faiss-cpu datasets tiktoken torch numpy tqdm bitsandbytes
+!pip install faiss-cpu datasets tiktoken torch numpy tqdm bitsandbytes huggingface_hub
+
 ```
 
 ## 2. Directory Structure

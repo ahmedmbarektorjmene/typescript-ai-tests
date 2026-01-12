@@ -65,14 +65,14 @@ bank.update_memory(old_id, new_embeddings, "New implementation...")
 
 ```bash
 # Optimized for Bun & Python 3.10+
-pip install faiss-cpu datasets tiktoken torch numpy tqdm hypercorn h2
+pip install faiss-cpu datasets tiktoken torch numpy tqdm hypercorn h2 huggingface_hub
 ```
 
 #### for GPU
 
 ```bash
 # Optimized for Bun & Python 3.10+
-pip install faiss-gpu datasets tiktoken torch numpy tqdm bitsandbytes fastapi hypercorn h2
+pip install faiss-gpu datasets tiktoken torch numpy tqdm bitsandbytes fastapi hypercorn h2 huggingface_hub
 ```
 
 ### 2. OpenAI-Compatible API
