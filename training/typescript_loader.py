@@ -11,13 +11,36 @@ from torch.utils.data import IterableDataset, DataLoader
 from typing import Iterator, Dict, Tuple
 from datasets import load_dataset
 
-try:
-    import tiktoken
+N_MIN = 3
+N_MAX = 8
+HASH_TABLE_SIZE = 500000
 
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
-
+def rolling_poly_hash(bytes_tensor: torch.Tensor, n: int, prime: int = 1000003) -> torch.Tensor:
+    """
+    Implements RollPolyHash from Equation 4 of the paper.
+    Computes a hash for every window of size n.
+    """
+    length = bytes_tensor.size(0)
+    hashes = torch.zeros(length, dtype=torch.long)
+    if length < n:
+        return hashes
+    
+    current_hash = 0
+    # Initial window
+    for i in range(n):
+        current_hash = (current_hash * 256 + bytes_tensor[i].item()) % HASH_TABLE_SIZE
+    
+    hashes[n-1] = current_hash
+    
+    # Rolling step
+    power = pow(256, n-1, HASH_TABLE_SIZE)
+    for i in range(n, length):
+        # Remove leading byte, add trailing byte
+        current_hash = (current_hash - bytes_tensor[i-n].item() * power) % HASH_TABLE_SIZE
+        current_hash = (current_hash * 256 + bytes_tensor[i].item()) % HASH_TABLE_SIZE
+        hashes[i] = current_hash
+        
+    return hashes
 
 def clean_code(code: str) -> str:
     """
@@ -34,22 +57,43 @@ class TypeScriptStreamingDataset(IterableDataset):
         self,
         max_samples: int = 100000,
         max_seq_len: int = 1024,
-        tokenizer_name: str = "cl100k_base",
+        entropy_threshold: float = 0.5,
     ):
         self.max_samples = max_samples
         self.max_seq_len = max_seq_len
+        self.entropy_threshold = entropy_threshold
 
-        if TIKTOKEN_AVAILABLE:
-            self.enc = tiktoken.get_encoding(tokenizer_name)
-        else:
-            self.enc = None
+    def _get_bytes(self, text: str) -> torch.Tensor:
+        """Converts text to raw UTF-8 bytes (0-255)."""
+        byte_data = text.encode("utf-8")
+        return torch.tensor(list(byte_data)[: self.max_seq_len], dtype=torch.long)
 
-    def _encode(self, text: str) -> torch.Tensor:
-        if self.enc:
-            tokens = self.enc.encode(text, allowed_special=set())
-        else:
-            tokens = [ord(c) % 50000 for c in text]
-        return torch.tensor(tokens[: self.max_seq_len], dtype=torch.long)
+    def _get_hash_ngrams(self, byte_tensor: torch.Tensor) -> torch.Tensor:
+        """Section 3.2.1: Encoder Hash n-gram Embeddings."""
+        length = byte_tensor.size(0)
+        # Table of [SeqLen, 6] (for n=3, 4, 5, 6, 7, 8)
+        all_hashes = torch.zeros((length, N_MAX - N_MIN + 1), dtype=torch.long)
+        
+        for idx, n in enumerate(range(N_MIN, N_MAX + 1)):
+            all_hashes[:, idx] = rolling_poly_hash(byte_tensor, n)
+            
+        return all_hashes
+
+    def _generate_patch_boundaries(self, byte_tensor: torch.Tensor) -> torch.Tensor:
+            """
+            Implements Entropy Patching (Section 2.3).
+            Note: Real BLT uses a 100M parameter Byte-LM. 
+            We use a space/punctuation proxy which the paper notes as a baseline (Section 2.2).
+            """
+            boundaries = torch.zeros_like(byte_tensor)
+            if len(boundaries) > 0: boundaries[0] = 1
+            
+            # Triggering on "High Entropy" structural characters
+            triggers = {10, 32, 46, 40, 123, 91, 59}
+            for i in range(1, len(byte_tensor)):
+                if byte_tensor[i].item() in triggers:
+                    boundaries[i] = 1
+            return boundaries
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         count = 0
@@ -120,8 +164,13 @@ class TypeScriptStreamingDataset(IterableDataset):
 
                     # Clean and Yield
                     cleaned = clean_code(raw_code)
+                    byte_ids = torch.tensor(list(cleaned.encode("utf-8"))[:self.max_seq_len], dtype=torch.long)
                     if len(cleaned) > 40:
-                        yield {"input_ids": self._encode(cleaned)}
+                        yield {
+                                "byte_ids": byte_ids,
+                                "patch_boundaries": self._generate_patch_boundaries(byte_ids),
+                                "hash_ngrams": self._get_hash_ngrams(byte_ids)
+                            }
                         count += 1
                         if count >= self.max_samples:
                             return
@@ -172,29 +221,44 @@ def create_typescript_dataloader(
 
     # Collate function for batching
     def collate_fn(batch):
-        source_seqs = [item["source_patches"] for item in batch]
-        target_seqs = [item["target_patches"] for item in batch]
+        """Custom collate to handle 3D hash n-gram tensors and convert to JEPA format."""
+        byte_ids = [item["byte_ids"] for item in batch]
+        boundaries = [item["patch_boundaries"] for item in batch]
+        hashes = [item["hash_ngrams"] for item in batch]
 
-        source_batch = torch.nn.utils.rnn.pad_sequence(
-            source_seqs, batch_first=True, padding_value=0
-        )
-        target_batch = torch.nn.utils.rnn.pad_sequence(
-            target_seqs, batch_first=True, padding_value=0
-        )
+        # Pad 1D sequences (Bytes and Boundaries)
+        byte_batch = torch.nn.utils.rnn.pad_sequence(byte_ids, batch_first=True, padding_value=0)
+        boundary_batch = torch.nn.utils.rnn.pad_sequence(boundaries, batch_first=True, padding_value=0)
+        
+        # Pad 2D sequences (Hashes: Batch, Seq, NGrams)
+        # Manual padding for the 3rd dimension complexity
+        max_len = byte_batch.shape[1]
+        n_gram_counts = hashes[0].shape[1]
+        padded_hashes = torch.zeros((len(batch), max_len, n_gram_counts), dtype=torch.long)
+        
+        for i, h in enumerate(hashes):
+            seq_len = h.shape[0]
+            padded_hashes[i, :seq_len, :] = h
 
-        if source_batch.shape[1] > max_source_len:
-            source_batch = source_batch[:, :max_source_len]
-        if target_batch.shape[1] > max_target_len:
-            target_batch = target_batch[:, :max_target_len]
+        # Return in JEPA format expected by trainer
+        return {
+            "source_patches": byte_batch,  # Use byte_ids as source patches
+            "target_patches": byte_batch,  # Use same byte_ids as target patches (self-supervised)
+            "patch_boundaries": boundary_batch,  # Keep boundaries for model
+            "hash_ngrams": padded_hashes  # Keep hash n-grams for model
+        }
 
-        return {"source_patches": source_batch, "target_patches": target_batch}
-
+    # Check if CUDA is available for pin_memory optimization
+    cuda_available = torch.cuda.is_available()
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         collate_fn=collate_fn,
+        pin_memory=cuda_available,  # Faster GPU transfer
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive
     )
     val_loader = DataLoader(
         val_dataset,
@@ -202,6 +266,8 @@ def create_typescript_dataloader(
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn,
+        pin_memory=cuda_available,  # Faster GPU transfer
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive
     )
 
     return train_loader, val_loader
@@ -214,16 +280,8 @@ class TypeScriptBufferedDataset(torch.utils.data.Dataset):
         self, streaming_dataset: TypeScriptStreamingDataset, buffer_size: int = 10000
     ):
         self.data = []
-        print(f"Buffering up to {buffer_size} samples from streaming dataset...")
         for sample in streaming_dataset:
-            self.data.append(
-                {
-                    "source_patches": sample["input_ids"],
-                    "target_patches": sample[
-                        "input_ids"
-                    ],  # syntax-only: source = target
-                }
-            )
+            self.data.append(sample)
             if len(self.data) >= buffer_size:
                 break
         print(f"Buffered {len(self.data)} samples.")
@@ -232,4 +290,5 @@ class TypeScriptBufferedDataset(torch.utils.data.Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
+        # Return the original sample data for collate_fn to process
         return self.data[idx]

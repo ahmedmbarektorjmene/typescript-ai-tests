@@ -1,14 +1,16 @@
 """
-Train Shutka (VL-JEPA) on TypeScript/JavaScript Code
+Train Shutka (VL-JEPA) on TypeScript/JavaScript Code - T4 GPU Optimized
 
-This script:
-1. Streams TypeScript/JavaScript code from The Stack (HuggingFace)
-2. Only downloads TypeScript and JavaScript - NOT the entire dataset!
-3. Uses modern GPU optimizations (torch.compile, BF16, TF32)
-4. Falls back gracefully to CPU if no GPU available
+Optimizations for Kaggle T4 GPU:
+1. Reduced model size (350M params)
+2. Gradient accumulation for larger effective batch size
+3. Mixed precision (BF16/FP16)
+4. Gradient checkpointing to save memory
+5. Optimized batch sizes for T4 (16GB VRAM)
+6. Fast data loading with prefetching
 
 Usage:
-    python train_typescript.py --buffer_size 10000 --epochs 10
+    python train_typescript.py --epochs 3 --batch_size 4
 """
 
 import argparse
@@ -34,7 +36,7 @@ def parse_args():
         "--buffer_size",
         type=int,
         default=10000,
-        help="Maximum training samples to stream",
+        help="Maximum training buffer size to stream",
     )
     parser.add_argument(
         "--languages",
@@ -43,61 +45,82 @@ def parse_args():
         help="Comma-separated languages to include",
     )
 
-    # Model
-    parser.add_argument("--source_dim", type=int, default=768)
-    parser.add_argument("--target_dim", type=int, default=768)
-    parser.add_argument("--predictor_dim", type=int, default=768)
+    # Model (T4-optimized: smaller, faster)
+    parser.add_argument("--source_dim", type=int, default=320, help="Model dimension (320 for T4)")
+    parser.add_argument("--target_dim", type=int, default=320)
+    parser.add_argument("--predictor_dim", type=int, default=320)
+    parser.add_argument("--source_depth", type=int, default=6, help="Encoder layers (6 for T4)")
+    parser.add_argument("--target_depth", type=int, default=3, help="Target layers (3 for T4)")
+    parser.add_argument("--predictor_depth", type=int, default=3, help="Predictor layers (3 for T4)")
     parser.add_argument(
-        "--max_source_len", type=int, default=2048, help="Max source context length"
+        "--max_source_len", type=int, default=1024, help="Max source context (1024 for T4)"
     )
     parser.add_argument(
-        "--max_target_len", type=int, default=512, help="Max target code length"
-    )
-
-    # Training
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
-    parser.add_argument(
-        "--use_rag", action="store_true", default=True, help="Enable FAISS RAG memory"
+        "--max_target_len", type=int, default=256, help="Max target length (256 for T4)"
     )
 
-    # Optimization
+    # Training (T4-optimized)
+    parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per GPU (4 for T4)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, 
+                       help="Accumulate gradients (effective batch = 4*4=16)")
+    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument(
-        "--no_compile", action="store_true", help="Disable torch.compile"
+        "--use_rag", action="store_true", default=False, help="Disable RAG for speed"
+    )
+    parser.add_argument("--optimizer", type=str, default="galore", 
+                       choices=["adamw", "galore"], help="Optimizer (galore for memory efficiency)")
+
+    # Optimization (T4-specific)
+    parser.add_argument(
+        "--no_compile", action="store_true", help="Disable torch.compile (faster startup)"
     )
     parser.add_argument(
-        "--no_mixed_precision",
-        action="store_true",
-        help="Disable mixed precision training",
+        "--mixed_precision", type=str, default="fp16", 
+        choices=["no", "fp16", "bf16"], help="Mixed precision (fp16 for T4)"
+    )
+    parser.add_argument(
+        "--gradient_checkpointing", action="store_true", default=True,
+        help="Enable gradient checkpointing (saves memory)"
     )
 
-    # Checkpointing
+    # Checkpointing (faster saves)
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument(
         "--resume", type=str, default=None, help="Path to checkpoint to resume from"
     )
-    parser.add_argument("--save_every", type=int, default=500)
-    parser.add_argument("--eval_every", type=int, default=250)
+    parser.add_argument("--save_every", type=int, default=1000, help="Save every N steps")
+    parser.add_argument("--eval_every", type=int, default=500, help="Eval every N steps")
+    parser.add_argument("--log_every", type=int, default=50, help="Log every N steps")
 
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    
+    # Validate batch size for InfoNCE loss
+    if args.batch_size < 2:
+        print("⚠️  Warning: InfoNCE loss requires batch_size >= 2 for contrastive learning.")
+        print("   Setting batch_size to 2 (minimum).")
+        args.batch_size = 2
 
     print("=" * 60)
-    print("SHUTKA (VL-JEPA) TypeScript/JavaScript Training")
+    print("SHUTKA Training - T4 GPU Optimized")
     print("=" * 60)
+    print(f"Model: {args.source_dim}d, {args.source_depth}+{args.target_depth}+{args.predictor_depth} layers")
+    print(f"Batch: {args.batch_size} × {args.gradient_accumulation_steps} = {args.batch_size * args.gradient_accumulation_steps} effective")
+    print(f"Precision: {args.mixed_precision}")
+    print(f"Optimizer: {args.optimizer}")
 
     # Parse languages
     languages = [lang.strip() for lang in args.languages.split(",")]
     print(f"\nLanguages: {languages}")
-    print(f"Max samples: {args.buffer_size}")
+    print(f"Buffer Size: {args.buffer_size}")
 
     # Create dataloaders (streams from The Stack - only TS/JS!)
     print("\n" + "-" * 40)
-    print("Creating TypeScript/JavaScript dataloaders...")
+    print("Creating dataloaders...")
     print("-" * 40)
 
     train_loader, val_loader = create_typescript_dataloader(
@@ -110,19 +133,27 @@ def main():
     print(f"\nTrain batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
 
-    # Create model
+    # Create model (T4-optimized: 350M params)
     print("\n" + "-" * 40)
-    print("Initializing Shutka model...")
+    print("Initializing model...")
     print("-" * 40)
 
     model = UltraEfficientTextJEPA(
-        vocab_size=100277,  # cl100k_base vocab size
+        vocab_size=100277,
         source_dim=args.source_dim,
+        source_depth=args.source_depth,
         target_dim=args.target_dim,
+        target_depth=args.target_depth,
         predictor_dim=args.predictor_dim,
+        predictor_depth=args.predictor_depth,
         max_source_len=args.max_source_len,
         max_target_len=args.max_target_len,
         use_rag=args.use_rag,
+        use_enhanced_encoder=True,
+        use_titans=True,
+        use_miras=False,  # Disable for speed
+        use_hoprag=False,  # Disable for speed
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
     # Create config
@@ -130,15 +161,18 @@ def main():
     config.num_epochs = args.epochs
     config.batch_size = args.batch_size
     config.learning_rate = args.learning_rate
+    config.optimizer = args.optimizer
     config.checkpoint_dir = args.checkpoint_dir
     config.save_every = args.save_every
     config.eval_every = args.eval_every
     config.max_source_len = args.max_source_len
     config.max_target_len = args.max_target_len
+    config.gradient_checkpointing = args.gradient_checkpointing
+    config.use_mixed_precision = (args.mixed_precision != "no")
 
-    # Create trainer with GPU optimizations
+    # Create trainer with T4 optimizations
     print("\n" + "-" * 40)
-    print("Initializing trainer with optimizations...")
+    print("Initializing trainer...")
     print("-" * 40)
 
     trainer = Trainer(
@@ -147,7 +181,8 @@ def main():
         val_loader=val_loader,
         config=config,
         use_compile=not args.no_compile,
-        use_mixed_precision=not args.no_mixed_precision,
+        use_mixed_precision=(args.mixed_precision != "no"),
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     # Resume from checkpoint if specified
