@@ -423,7 +423,7 @@ class Trainer:
                 {
                     "loss": f"{loss_val:.4f}",
                     "avg": f"{avg_loss_val:.4f}",
-                    "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
+                    "lr": f"{self.scheduler.get_last_lr()[0]:.6f}",
                     "mem": f"{self.memory_stats['current_memory_mb']:.0f}MB",
                     "tok/s": f"{self.memory_stats['tokens_per_sec']:.0f}",
                 }
