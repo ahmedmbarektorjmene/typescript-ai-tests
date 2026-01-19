@@ -529,7 +529,14 @@ class Trainer:
         # Use backward-compatible loading
         self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        try:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        except ValueError as e:
+            print(
+                f"Warning: Optimizer state mismatch ({e}). Initializing fresh optimizer."
+            )
+        except Exception as e:
+            print(f"Warning: Could not load optimizer state: {e}")
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.global_step = checkpoint["global_step"]
         self.best_val_loss = checkpoint["best_val_loss"]
