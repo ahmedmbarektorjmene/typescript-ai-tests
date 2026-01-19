@@ -478,8 +478,8 @@ class Trainer:
             print(f"  Peak Memory: {self.memory_stats['peak_memory_mb']:.0f}MB")
             print(f"  Throughput: {self.memory_stats['tokens_per_sec']:.0f} tokens/sec")
 
-            # Save checkpoint at end of epoch
-            self.save_checkpoint(f"checkpoint_epoch_{epoch}.pt")
+            # Save last checkpoint (overwrites previous to save disk space)
+            self.save_checkpoint("checkpoint_last.pt")
 
             # Save best model
             if val_loss < self.best_val_loss:
