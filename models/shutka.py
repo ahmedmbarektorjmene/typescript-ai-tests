@@ -439,6 +439,7 @@ class UltraEfficientTextJEPA(nn.Module):
         self.source_dim = source_dim
 
         self.token_embed = nn.Embedding(vocab_size, source_dim)
+        nn.init.normal_(self.token_embed.weight, std=0.02)
 
         # DeepSeek v4 Engrams Layer
         # Placed after embedding, before transformer blocks

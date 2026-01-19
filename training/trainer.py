@@ -393,8 +393,7 @@ class Trainer:
                     continue
 
                 self.optimizer.step()
-
-            self.scheduler.step()
+                self.scheduler.step()
 
             # Update metrics
             total_loss += loss.item()
