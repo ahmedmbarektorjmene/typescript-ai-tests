@@ -148,7 +148,16 @@ class CombinedRealDataset(IterableDataset):
         )
 
         for sample in code_ds:
-            yield sample
+            # Remap keys to match RealInstructionDataset schema
+            # TypeScript dataset yields 'byte_ids', we need 'source_patches'/'target_patches'
+            yield {
+                "source_patches": sample["byte_ids"],
+                "target_patches": sample[
+                    "byte_ids"
+                ],  # Self-supervised: target is same as source
+                "hash_ngrams": sample["hash_ngrams"],
+                "patch_boundaries": sample["patch_boundaries"],
+            }
             sample_count += 1
 
         print(f"Code samples: {sample_count}")
