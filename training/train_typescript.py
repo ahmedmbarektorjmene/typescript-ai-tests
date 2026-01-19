@@ -45,20 +45,18 @@ def parse_args():
         help="Comma-separated languages to include",
     )
 
-    # Model (T4-optimized: smaller, faster)
+    # Model (Shutka-v2 350M Spec)
     parser.add_argument(
-        "--source_dim", type=int, default=320, help="Model dimension (320 for T4)"
+        "--source_dim", type=int, default=512, help="Model dimension (512 for 350M)"
     )
-    parser.add_argument("--target_dim", type=int, default=320)
-    parser.add_argument("--predictor_dim", type=int, default=320)
+    parser.add_argument("--target_dim", type=int, default=512)
+    parser.add_argument("--predictor_dim", type=int, default=512)
     parser.add_argument(
-        "--source_depth", type=int, default=6, help="Encoder layers (6 for T4)"
+        "--source_depth", type=int, default=24, help="Encoder layers (24 for 350M)"
     )
+    parser.add_argument("--target_depth", type=int, default=4, help="Target layers")
     parser.add_argument(
-        "--target_depth", type=int, default=3, help="Target layers (3 for T4)"
-    )
-    parser.add_argument(
-        "--predictor_depth", type=int, default=3, help="Predictor layers (3 for T4)"
+        "--predictor_depth", type=int, default=4, help="Predictor layers"
     )
     parser.add_argument(
         "--max_source_len",
@@ -179,6 +177,7 @@ def main():
         target_depth=args.target_depth,
         predictor_dim=args.predictor_dim,
         predictor_depth=args.predictor_depth,
+        output_dim=args.source_dim,  # Matches source dim
         max_source_len=args.max_source_len,
         max_target_len=args.max_target_len,
         use_rag=args.use_rag,
