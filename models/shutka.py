@@ -87,9 +87,10 @@ class BitLinear(nn.Module):
 
     def forward(self, x):
         x_norm = self.norm(x)
-        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
+        # Optimized W1.58 A16: No activation quantization (faster, no overhead)
+        # Weights are ternary {-1, 0, 1}, Activations are FP16/BF16
         w_quant = self.weight + (weight_quant(self.weight) - self.weight).detach()
-        return F.linear(x_quant, w_quant, self.bias)
+        return F.linear(x_norm, w_quant, self.bias)
 
 
 class QuantizedLinear(nn.Module):
