@@ -120,7 +120,9 @@ def parse_args():
     parser.add_argument(
         "--eval_every", type=int, default=500, help="Eval every N steps"
     )
-    parser.add_argument("--log_every", type=int, default=50, help="Log every N steps")
+    parser.add_argument(
+        "--num_workers", type=int, default=2, help="Number of data loader workers"
+    )
 
     return parser.parse_args()
 
@@ -146,6 +148,7 @@ def main():
         f"Batch: {args.batch_size} × {args.gradient_accumulation_steps} = {args.batch_size * args.gradient_accumulation_steps} effective"
     )
     print(f"Precision: {args.mixed_precision}")
+    print(f"Workers: {args.num_workers}")
 
     # Parse languages
     languages = [lang.strip() for lang in args.languages.split(",")]
@@ -162,6 +165,7 @@ def main():
         max_source_len=args.max_source_len,
         max_target_len=args.max_target_len,
         buffer_size=args.buffer_size,
+        num_workers=args.num_workers,
     )
 
     print(f"\nTrain batches: {len(train_loader)}")
