@@ -91,9 +91,10 @@ def parse_args():
 
     # Optimization (T4-specific)
     parser.add_argument(
-        "--no_compile",
+        "--compile",
         action="store_true",
-        help="Disable torch.compile (faster startup)",
+        default=False,
+        help="Enable torch.compile (can be slow on T4)",
     )
     parser.add_argument(
         "--mixed_precision",
@@ -218,7 +219,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         config=config,
-        use_compile=not args.no_compile,
+        use_compile=args.compile,
         use_mixed_precision=(args.mixed_precision != "no"),
         gradient_accumulation_steps=args.gradient_accumulation_steps,
     )

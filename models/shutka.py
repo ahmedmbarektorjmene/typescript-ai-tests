@@ -213,7 +213,7 @@ class ManifoldHyperConnection(nn.Module):
     Uses iterative Sinkhorn normalization (Row norm -> Col norm -> ...).
     """
 
-    def __init__(self, num_streams: int, num_iters: int = 5):
+    def __init__(self, num_streams: int, num_iters: int = 3):
         super().__init__()
         self.n = num_streams
         self.num_iters = num_iters
