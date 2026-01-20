@@ -5,7 +5,7 @@ Configuration file for Shutka (VL-JEPA) training and evaluation
 import os
 import torch
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import List, Tuple
 
 
 def validate_config(config: "TrainingConfig") -> Tuple[bool, List[str]]:
@@ -62,51 +62,20 @@ def validate_config(config: "TrainingConfig") -> Tuple[bool, List[str]]:
             f"learning_rate ({config.learning_rate}) should be between 0 and 1.0"
         )
 
-    # Check Titans Memory configuration
-    if config.use_titans:
-        if config.titans_capacity < 100:
-            errors.append(
-                f"titans_capacity ({config.titans_capacity}) should be at least 100"
-            )
+    # Check sequence length limits
+    if config.max_source_len < 128:
+        errors.append(
+            f"max_source_len ({config.max_source_len}) should be at least 128 tokens"
+        )
 
-        if config.titans_depth < 1 or config.titans_depth > 10:
-            errors.append(
-                f"titans_depth ({config.titans_depth}) should be between 1 and 10"
-            )
-
-        if config.titans_surprise_threshold < 0 or config.titans_surprise_threshold > 1:
-            errors.append(
-                f"titans_surprise_threshold ({config.titans_surprise_threshold}) should be between 0 and 1"
-            )
-
-    # Check MIRAS configuration
-    if config.use_miras and not config.use_titans:
-        errors.append("MIRAS requires Titans Memory to be enabled (use_titans=True)")
-
-    if config.use_miras:
-        if (
-            config.miras_confidence_threshold < 0
-            or config.miras_confidence_threshold > 1
-        ):
-            errors.append(
-                f"miras_confidence_threshold ({config.miras_confidence_threshold}) should be between 0 and 1"
-            )
-
-    # Check HopRAG configuration
-    if config.use_hoprag and not config.use_miras:
-        errors.append("HopRAG requires MIRAS to be enabled (use_miras=True)")
-
-    if config.use_hoprag:
-        if config.hoprag_max_hops < 1 or config.hoprag_max_hops > 10:
-            errors.append(
-                f"hoprag_max_hops ({config.hoprag_max_hops}) should be between 1 and 10"
-            )
+    if config.max_target_len < 32:
+        errors.append(
+            f"max_target_len ({config.max_target_len}) should be at least 32 tokens"
+        )
 
     # Check gradient checkpointing compatibility
-    if config.gradient_checkpointing and not config.use_enhanced_encoder:
-        errors.append(
-            "Gradient checkpointing requires enhanced encoder (use_enhanced_encoder=True)"
-        )
+    if config.gradient_checkpointing:
+        pass  # No strict requirement for enhanced encoder anymore
 
     # Check directory existence
     if not os.path.exists(config.data_dir):
@@ -168,15 +137,16 @@ def check_hardware_capabilities() -> dict:
 class TrainingConfig:
     """Training configuration for Shutka (JEPA with lightning Attention 2)"""
 
-    # lightning Attention 2 Architecture parameters
+    # Architecture parameters
     vocab_size: int = 100277  # Modern OpenAI (cl100k_base) vocabulary size
-    source_dim: int = 768  # Standard Base dimension
-    source_depth: int = 12  # Deeper encoder for better semantics
-    target_dim: int = 768  # Match source dim
-    target_depth: int = 6  # Efficient target encoder
-    predictor_dim: int = 768  # Match dimensions
-    predictor_depth: int = 6  # Efficient predictor
-    output_dim: int = 1536  # Projection dimension
+    source_dim: int = 512  # Resize to 512 for 350M target
+    source_depth: int = 24  # Resized for 350M target
+    target_dim: int = 512
+    target_depth: int = 6
+    predictor_dim: int = 512
+    predictor_depth: int = 6
+    output_dim: int = 512
+    temperature: float = 0.07  # InfoNCE temperature
     temperature: float = 0.07  # InfoNCE temperature
 
     # Sequence & Tiling (lightning Attention 2)
@@ -184,9 +154,9 @@ class TrainingConfig:
     max_target_len: int = 512  # Target prediction length
     chunk_size: int = 128  # Chunk size for lightning Attention 2
 
-    # Training parameters
-    learning_rate: float = 3e-4  # Slightly higher for BPE
-    batch_size: int = 8  # Adjusted for larger dim
+    # Optimization
+    learning_rate: float = 3e-4
+    batch_size: int = 2  # Memory efficient default
     num_epochs: int = 10
     optimizer: str = "galore"
     weight_decay: float = 0.01
@@ -194,30 +164,6 @@ class TrainingConfig:
     # Data parameters
     data_dir: str = "data"
     train_split: float = 0.9
-
-    # RAG parameters (Huge Memory)
-    use_rag: bool = True
-    rag_index_type: str = "IVF4096,Flat"  # Efficient clustering for huge index
-    rag_storage_mode: str = "mmap"  # Load from disk, not RAM
-
-    # Enhanced Architecture (CPU-Optimized)
-    use_enhanced_encoder: bool = True  # Enable CPU-optimized architecture
-    use_titans: bool = True  # Titans Memory (test-time learning)
-    use_miras: bool = True  # MIRAS three-tier retrieval
-    use_hoprag: bool = True  # HopRAG multi-hop reasoning
-    bing_api_key: Optional[str] = None  # Bing Search API key (optional)
-
-    # Titans Memory Configuration
-    titans_capacity: int = 10000  # Memory capacity
-    titans_depth: int = 3  # Memory MLP depth
-    titans_surprise_threshold: float = 0.5  # Update threshold
-
-    # MIRAS Configuration
-    miras_confidence_threshold: float = 0.7  # Retrieval confidence threshold
-
-    # HopRAG Configuration
-    hoprag_max_hops: int = 3  # Maximum reasoning hops
-    hoprag_adaptive_threshold: bool = True  # Use adaptive sufficiency
 
     # Checkpointing
     checkpoint_dir: str = "checkpoints"

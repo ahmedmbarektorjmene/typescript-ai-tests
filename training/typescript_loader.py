@@ -13,7 +13,7 @@ from datasets import load_dataset
 
 N_MIN = 3
 N_MAX = 8
-HASH_TABLE_SIZE = 500000
+HASH_TABLE_SIZE = 370000
 
 
 def rolling_poly_hash(

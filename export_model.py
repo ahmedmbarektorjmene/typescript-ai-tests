@@ -60,8 +60,47 @@ def export_inference_model(
                     "    ! Config not found in checkpoint. Using default 350M config."
                 )
 
+    # Validating Config against Weights (CRITICAL FIX for T4/350M models)
+    if "model_state_dict" in checkpoint:
+        sd = checkpoint["model_state_dict"]
+        if "token_embed.weight" in sd:
+            weight_dim = sd["token_embed.weight"].shape[1]
+            if config.get("source_dim") != weight_dim:
+                if verbose:
+                    print(
+                        f"    ! Config mismatch detected: config.source_dim={config.get('source_dim')} but weights are {weight_dim}."
+                    )
+                    print(
+                        f"    ! Overriding config to match weights: source_dim={weight_dim}"
+                    )
+                config["source_dim"] = weight_dim
+                config["target_dim"] = weight_dim
+                config["predictor_dim"] = weight_dim
+                config["output_dim"] = weight_dim
+
     model = UltraEfficientTextJEPA(**config)
+
+    # Load weights (CRITICAL FIX)
+    if "model_state_dict" in checkpoint:
+        if verbose:
+            print("    • Loading model weights...")
+        try:
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        except Exception as e:
+            print(f"    ! Warning loading weights: {e}")
+
     model.eval()
+
+    # Optimization: Precompute mHC and strip training layers
+    if hasattr(model, "precompute_mhc"):
+        if verbose:
+            print("    • Precomputing mHC matrices...")
+        model.precompute_mhc()
+
+    if hasattr(model, "strip_for_inference"):
+        if verbose:
+            print("    • Stripping training-only layers (Predictor/Target)...")
+        model.strip_for_inference()
 
     # Disable gradients
     for param in model.parameters():
@@ -69,7 +108,7 @@ def export_inference_model(
 
     if verbose:
         param_count = sum(p.numel() for p in model.parameters())
-        print(f"\n[*] Model Parameter Count: {param_count / 1e6:.1f}M (Target: 350M)")
+        print(f"\n[*] Optimized Model Parameter Count: {param_count / 1e6:.1f}M")
 
     # Scripting Support
     if script:
@@ -77,15 +116,13 @@ def export_inference_model(
             print("\n[*] Attempting TorchScript Export...")
         try:
             # Create dummy inputs for tracing
-            # input ids: [B, L]
             dummy_input = torch.randint(0, 1000, (1, 128), dtype=torch.long)
-            # hash ngrams: [B, L, 6] (assuming 6 ngram orders)
-            dummy_hashes = torch.randint(0, 370000, (1, 128, 6), dtype=torch.long)
+            dummy_hashes = torch.randint(
+                0, config["engram_vocab_size"], (1, 128, 6), dtype=torch.long
+            )
 
             # Trace the model
-            # Note: We trace 'predict_next' or 'forward' depending on usage
-            # Here we trace forward
-            traced_model = torch.jit.trace(model, (dummy_input, dummy_hashes))
+            traced_model = torch.jit.trace(model, (dummy_input, None, dummy_hashes))
 
             script_path = output_path.replace(".pt", "_script.pt")
             torch.jit.save(traced_model, script_path)
@@ -93,14 +130,18 @@ def export_inference_model(
                 print(f"    • TorchScript model saved: {script_path} [OK]")
         except Exception as e:
             print(f"    ! TorchScript export failed: {e}")
-            print("    ! Proceeding with standard export.")
 
-    # Standard Save
+    # Standard Save with Ternary Weights
+    # BitNet 1.58-bit: weights are {-1, 0, 1}
+    if verbose:
+        print("\n[*] Saving model in native Ternary (1.58-bit) format...")
+
     export_data = {
         "model_state_dict": model.state_dict(),
         "config": config,
         "inference_only": True,
         "optimized": optimize,
+        "quantization": "bitnet_1.58",
     }
 
     os.makedirs(
@@ -111,6 +152,9 @@ def export_inference_model(
 
     if verbose:
         print(f"\n[OK] Export complete: {output_path}")
+        print(
+            "    💡 Note: Model is saved in Ternary format. Load with UltraEfficientTextJEPA."
+        )
 
 
 if __name__ == "__main__":

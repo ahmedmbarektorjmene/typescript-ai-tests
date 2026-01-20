@@ -2,7 +2,467 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+
+# Triton for High Performance Attention
+try:
+    import triton
+    import triton.language as tl
+
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+
+
+# ============================================================================
+# TRITON KERNELS (Lightning Attention 2)
+# ============================================================================
+
+if TRITON_AVAILABLE:
+
+    @triton.jit
+    def _fwd_kernel(
+        Q,
+        K,
+        V,
+        Out,
+        S,
+        b: tl.constexpr,
+        h: tl.constexpr,
+        n: tl.constexpr,
+        d: tl.constexpr,
+        e: tl.constexpr,
+        BLOCK: tl.constexpr,
+        NUM_BLOCK: tl.constexpr,
+        BLOCK_MODEL: tl.constexpr,
+    ):
+        off_bh = tl.program_id(0)
+        off_h = off_bh % h
+        off_e = tl.program_id(1)
+        qk_offset = off_bh * n * d
+        v_offset = off_bh * n * e
+        o_offset = off_bh * n * e
+        e_offset = off_e * BLOCK_MODEL
+
+        Q_block_ptr = Q + qk_offset + tl.arange(0, d)[None, :]
+        K_trans_block_ptr = K + qk_offset + tl.arange(0, d)[:, None]
+        V_block_ptr = V + v_offset + e_offset + tl.arange(0, BLOCK_MODEL)[None, :]
+        O_block_ptr = Out + o_offset + e_offset + tl.arange(0, BLOCK_MODEL)[None, :]
+        S_block_ptr = S + off_h
+
+        s = tl.load(S_block_ptr)
+        off_block = tl.arange(0, BLOCK)
+        q_decay = tl.exp(-s.to(tl.float32) * off_block[:, None])
+        k_trans_decay = tl.exp(-s.to(tl.float32) * (BLOCK - off_block[None, :]))
+        block_decay = tl.exp(-s.to(tl.float32) * BLOCK)
+
+        index = off_block[:, None] - off_block[None, :]
+        s_index = s * index
+        s_index = tl.where(index >= 0, -s_index, float("-inf"))
+        diag_decay = tl.exp(s_index)
+        kv = tl.zeros([d, BLOCK_MODEL], dtype=tl.float32)
+
+        for i in range(NUM_BLOCK):
+            q = tl.load(
+                Q_block_ptr + off_block[:, None] * d,
+                mask=off_block[:, None] < n,
+                other=0.0,
+            ).to(tl.float32)
+            k_trans = tl.load(
+                K_trans_block_ptr + off_block[None, :] * d,
+                mask=off_block[None, :] < n,
+                other=0.0,
+            ).to(tl.float32)
+            v = tl.load(
+                V_block_ptr + off_block[:, None] * e,
+                mask=off_block[:, None] < n,
+                other=0.0,
+            ).to(tl.float32)
+
+            qk = tl.dot(q, k_trans) * diag_decay
+            o_intra = tl.dot(qk, v)
+            o_inter = tl.dot(q, kv) * q_decay
+            o = o_intra + o_inter
+
+            tl.store(
+                O_block_ptr + off_block[:, None] * e,
+                o.to(O_block_ptr.dtype.element_ty),
+                mask=off_block[:, None] < n,
+            )
+            kv = block_decay * kv + tl.dot(k_trans * k_trans_decay, v)
+            off_block += BLOCK
+
+    @triton.jit
+    def _bwd_intra_kernel(
+        Q,
+        K,
+        V,
+        S,
+        DO,
+        DQ,
+        DK,
+        DV,
+        b: tl.constexpr,
+        h: tl.constexpr,
+        n: tl.constexpr,
+        d: tl.constexpr,
+        e: tl.constexpr,
+        BLOCK: tl.constexpr,
+        NUM_BLOCK: tl.constexpr,
+        CBLOCK: tl.constexpr,
+        NUM_CBLOCK: tl.constexpr,
+    ):
+        off_bh = tl.program_id(0)
+        off_block = tl.program_id(1)
+        off_h = off_bh % h
+        qk_offset = off_bh * n * d
+        v_offset = off_bh * n * e
+        o_offset = off_bh * n * e
+        block_offset = off_block * BLOCK + tl.arange(0, BLOCK)
+
+        Q_trans_block_ptr = (
+            Q + qk_offset + block_offset[None, :] * d + tl.arange(0, d)[:, None]
+        )
+        K_block_ptr = (
+            K + qk_offset + block_offset[:, None] * d + tl.arange(0, d)[None, :]
+        )
+        V_trans_block_ptr = (
+            V + v_offset + block_offset[None, :] * e + tl.arange(0, e)[:, None]
+        )
+
+        DQ_block_ptr = (
+            DQ + qk_offset + block_offset[:, None] * d + tl.arange(0, d)[None, :]
+        )
+        DK_trans_block_ptr = (
+            DK + qk_offset + block_offset[None, :] * d + tl.arange(0, d)[:, None]
+        )
+        DV_block_ptr = (
+            DV + v_offset + block_offset[:, None] * e + tl.arange(0, e)[None, :]
+        )
+        DO_block_ptr = (
+            DO + o_offset + block_offset[:, None] * e + tl.arange(0, e)[None, :]
+        )
+
+        S_block_ptr = S + off_h
+        s = tl.load(S_block_ptr)
+        array = tl.arange(0, BLOCK).to(tl.float32)
+        index = array[:, None] - array[None, :]
+        s_index = s * index
+        s_index = tl.where(index >= 0, -s_index, float("-inf"))
+        diag_decay = tl.exp(s_index)
+        diag_decay_trans = tl.trans(diag_decay)
+
+        k = tl.load(K_block_ptr, mask=block_offset[:, None] < n, other=0.0).to(
+            tl.float32
+        )
+        v_trans = tl.load(
+            V_trans_block_ptr, mask=block_offset[None, :] < n, other=0.0
+        ).to(tl.float32)
+        do = tl.load(DO_block_ptr, mask=block_offset[:, None] < n, other=0.0).to(
+            tl.float32
+        )
+        q_trans = tl.load(
+            Q_trans_block_ptr, mask=block_offset[None, :] < n, other=0.0
+        ).to(tl.float32)
+
+        dqk = tl.dot(do, v_trans) * diag_decay
+        dq = tl.dot(dqk, k)
+        dk_trans = tl.dot(q_trans, dqk)
+        qk_trans = tl.dot(k, q_trans) * diag_decay_trans
+        dv = tl.dot(qk_trans, do)
+
+        tl.store(
+            DQ_block_ptr,
+            dq.to(DQ_block_ptr.dtype.element_ty),
+            mask=block_offset[:, None] < n,
+        )
+        tl.store(
+            DK_trans_block_ptr,
+            dk_trans.to(DK_trans_block_ptr.dtype.element_ty),
+            mask=block_offset[None, :] < n,
+        )
+        tl.store(
+            DV_block_ptr,
+            dv.to(DV_block_ptr.dtype.element_ty),
+            mask=block_offset[:, None] < n,
+        )
+
+    @triton.jit
+    def _bwd_inter_kernel(
+        Q,
+        K,
+        V,
+        S,
+        DO,
+        DQ,
+        DK,
+        DV,
+        b: tl.constexpr,
+        h: tl.constexpr,
+        n: tl.constexpr,
+        d: tl.constexpr,
+        e: tl.constexpr,
+        BLOCK: tl.constexpr,
+        NUM_BLOCK: tl.constexpr,
+        CBLOCK: tl.constexpr,
+        NUM_CBLOCK: tl.constexpr,
+    ):
+        off_bh = tl.program_id(0)
+        off_h = off_bh % h
+        qk_offset = off_bh * n * d
+        v_offset = off_bh * n * e
+        o_offset = off_bh * n * e
+        S_block_ptr = S + off_h
+
+        DQ_block_ptr = (
+            DQ
+            + qk_offset
+            + tl.arange(0, CBLOCK)[:, None] * d
+            + tl.arange(0, d)[None, :]
+        )
+        K_block_ptr = (
+            K + qk_offset + tl.arange(0, CBLOCK)[:, None] * d + tl.arange(0, d)[None, :]
+        )
+        V_trans_block_ptr = (
+            V + v_offset + tl.arange(0, CBLOCK)[None, :] * e + tl.arange(0, e)[:, None]
+        )
+        DO_block_ptr = (
+            DO + o_offset + tl.arange(0, CBLOCK)[:, None] * e + tl.arange(0, e)[None, :]
+        )
+        off_block1, off_block2 = tl.arange(0, CBLOCK), tl.arange(0, CBLOCK)
+        c_array = tl.arange(0, CBLOCK)
+
+        s = tl.load(S_block_ptr)
+        block_decay = tl.exp(-s.to(tl.float32) * BLOCK)
+        kv_trans = tl.zeros([e, d], dtype=tl.float32)
+
+        for i in range(NUM_BLOCK):
+            for j in range(NUM_CBLOCK):
+                if i > 0:
+                    q_decay = tl.exp(
+                        -s.to(tl.float32) * (j * CBLOCK + c_array[:, None])
+                    )
+                    do = tl.load(
+                        DO_block_ptr, mask=off_block1[:, None] < n, other=0.0
+                    ).to(tl.float32)
+                    dq = tl.dot(do, kv_trans) * q_decay + tl.load(
+                        DQ_block_ptr, mask=off_block1[:, None] < n, other=0.0
+                    )
+                    tl.store(
+                        DQ_block_ptr,
+                        dq.to(DQ_block_ptr.dtype.element_ty),
+                        mask=off_block1[:, None] < n,
+                    )
+                DQ_block_ptr += CBLOCK * d
+                DO_block_ptr += CBLOCK * e
+                off_block1 += CBLOCK
+
+            kv_trans_current = tl.zeros([e, d], dtype=tl.float32)
+            for j in range(NUM_CBLOCK):
+                v_trans = tl.load(
+                    V_trans_block_ptr, mask=off_block2[None, :] < n, other=0.0
+                ).to(tl.float32)
+                k = tl.load(K_block_ptr, mask=off_block2[:, None] < n, other=0.0).to(
+                    tl.float32
+                )
+                k_decay = tl.exp(
+                    -s.to(tl.float32) * (BLOCK - (j * CBLOCK + c_array[:, None]))
+                )
+                kv_trans_current += tl.dot(v_trans, k * k_decay)
+                K_block_ptr += CBLOCK * d
+                V_trans_block_ptr += CBLOCK * e
+                off_block2 += CBLOCK
+            kv_trans = block_decay * kv_trans + kv_trans_current
+
+        m = NUM_BLOCK * BLOCK
+        off_block1, off_block2 = m + tl.arange(0, CBLOCK), m + tl.arange(0, CBLOCK)
+        Q_trans_block_ptr = (
+            Q
+            + qk_offset
+            + m * d
+            + tl.arange(0, CBLOCK)[None, :] * d
+            + tl.arange(0, d)[:, None]
+        )
+        K_block_ptr = (
+            K
+            + qk_offset
+            + m * d
+            + tl.arange(0, CBLOCK)[:, None] * d
+            + tl.arange(0, d)[None, :]
+        )
+        V_trans_block_ptr = (
+            V
+            + v_offset
+            + m * e
+            + tl.arange(0, CBLOCK)[None, :] * e
+            + tl.arange(0, e)[:, None]
+        )
+        DK_trans_block_ptr = (
+            DK
+            + qk_offset
+            + m * d
+            + tl.arange(0, CBLOCK)[None, :] * d
+            + tl.arange(0, d)[:, None]
+        )
+        DV_block_ptr = (
+            DV
+            + v_offset
+            + m * e
+            + tl.arange(0, CBLOCK)[:, None] * e
+            + tl.arange(0, e)[None, :]
+        )
+        DO_block_ptr = (
+            DO
+            + o_offset
+            + m * e
+            + tl.arange(0, CBLOCK)[:, None] * e
+            + tl.arange(0, e)[None, :]
+        )
+
+        dkv = tl.zeros([d, e], dtype=tl.float32)
+        for i in range(NUM_BLOCK - 1, -1, -1):
+            for j in range(NUM_CBLOCK - 1, -1, -1):
+                K_block_ptr -= CBLOCK * d
+                V_trans_block_ptr -= CBLOCK * e
+                DK_trans_block_ptr -= CBLOCK * d
+                DV_block_ptr -= CBLOCK * e
+                off_block1 -= CBLOCK
+                if i < NUM_BLOCK - 1:
+                    k = tl.load(
+                        K_block_ptr, mask=off_block1[:, None] < n, other=0.0
+                    ).to(tl.float32)
+                    v_trans = tl.load(
+                        V_trans_block_ptr, mask=off_block1[None, :] < n, other=0.0
+                    ).to(tl.float32)
+                    k_decay_trans = tl.exp(
+                        -s.to(tl.float32) * (BLOCK - (j * CBLOCK + c_array[None, :]))
+                    )
+                    k_decay = tl.exp(
+                        -s.to(tl.float32) * (BLOCK - (j * CBLOCK + c_array[:, None]))
+                    )
+                    dk_trans = tl.dot(dkv, v_trans) * k_decay_trans + tl.load(
+                        DK_trans_block_ptr, mask=off_block1[None, :] < n, other=0.0
+                    )
+                    dv = tl.dot(k, dkv) * k_decay + tl.load(
+                        DV_block_ptr, mask=off_block1[:, None] < n, other=0.0
+                    )
+                    tl.store(
+                        DK_trans_block_ptr,
+                        dk_trans.to(DK_trans_block_ptr.dtype.element_ty),
+                        mask=off_block1[None, :] < n,
+                    )
+                    tl.store(
+                        DV_block_ptr,
+                        dv.to(DV_block_ptr.dtype.element_ty),
+                        mask=off_block1[:, None] < n,
+                    )
+
+            dkv_current = tl.zeros([d, e], dtype=tl.float32)
+            for j in range(NUM_CBLOCK - 1, -1, -1):
+                DO_block_ptr -= CBLOCK * e
+                Q_trans_block_ptr -= CBLOCK * d
+                off_block2 -= CBLOCK
+                do = tl.load(DO_block_ptr, mask=off_block2[:, None] < n, other=0.0).to(
+                    tl.float32
+                )
+                q_trans = tl.load(
+                    Q_trans_block_ptr, mask=off_block2[None, :] < n, other=0.0
+                ).to(tl.float32)
+                q_decay_trans = tl.exp(
+                    -s.to(tl.float32) * (j * CBLOCK + c_array[None, :])
+                )
+                dkv_current += tl.dot(q_trans * q_decay_trans, do)
+            dkv = block_decay * dkv + dkv_current
+
+    class LightningAttention2Function(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, q, k, v, s):
+            q, k, v, s = q.contiguous(), k.contiguous(), v.contiguous(), s.contiguous()
+            b, h, n, d = q.shape
+            e = v.shape[-1]
+            o = torch.empty((b, h, n, e), dtype=q.dtype, device=q.device)
+            BLOCK = 64
+            NUM_BLOCK = triton.cdiv(n, BLOCK)
+            BLOCK_MODEL = min(triton.next_power_of_2(e), 32)
+            grid = (b * h, triton.cdiv(e, BLOCK_MODEL))
+            _fwd_kernel[grid](
+                q,
+                k,
+                v,
+                o,
+                s,
+                b,
+                h,
+                n,
+                d,
+                e,
+                BLOCK=BLOCK,
+                NUM_BLOCK=NUM_BLOCK,
+                BLOCK_MODEL=BLOCK_MODEL,
+            )
+            ctx.save_for_backward(q, k, v, s)
+            return o
+
+        @staticmethod
+        def backward(ctx, do):
+            q, k, v, s = ctx.saved_tensors
+            q, k, v, s, do = (
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                s.contiguous(),
+                do.contiguous(),
+            )
+            dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+            b, h, n, d = q.shape
+            e = v.shape[-1]
+            BLOCK, CBLOCK = 64, 32
+            NUM_BLOCK, NUM_CBLOCK = triton.cdiv(n, BLOCK), BLOCK // CBLOCK
+            grid_intra = (b * h, NUM_BLOCK)
+            _bwd_intra_kernel[grid_intra](
+                q,
+                k,
+                v,
+                s,
+                do,
+                dq,
+                dk,
+                dv,
+                b,
+                h,
+                n,
+                d,
+                e,
+                BLOCK=BLOCK,
+                NUM_BLOCK=NUM_BLOCK,
+                CBLOCK=CBLOCK,
+                NUM_CBLOCK=NUM_CBLOCK,
+            )
+            grid_inter = (b * h,)
+            _bwd_inter_kernel[grid_inter](
+                q,
+                k,
+                v,
+                s,
+                do,
+                dq,
+                dk,
+                dv,
+                b,
+                h,
+                n,
+                d,
+                e,
+                BLOCK=BLOCK,
+                NUM_BLOCK=NUM_BLOCK,
+                CBLOCK=CBLOCK,
+                NUM_CBLOCK=NUM_CBLOCK,
+            )
+            return dq, dk, dv, None
+
+    lightning_attn2_fn = LightningAttention2Function.apply
+else:
+    lightning_attn2_fn = None
+
 
 # ============================================================================
 # MODERN TRANSFORMER COMPONENTS
@@ -10,360 +470,222 @@ from typing import Optional
 
 
 def precompute_rope_freqs(dim: int, seq_len: int, theta: float = 10000.0):
-    """Precompute frequency constants for RoPE (Real-valued for compiler)"""
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
     t = torch.arange(seq_len).float()
-    freqs = torch.outer(t, inv_freq)  # (seq_len, dim/2)
+    freqs = torch.outer(t, inv_freq)
     return torch.cos(freqs), torch.sin(freqs)
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """Apply Rotary Positional Embeddings using real-valued rotation matrix"""
+def apply_rope(x, cos, sin):
     B, N, H, D = x.shape
-
-    if cos.shape[0] < N:
-        pad_len = N - cos.shape[0]
-        cos = F.pad(cos, (0, 0, 0, pad_len))
-        sin = F.pad(sin, (0, 0, 0, pad_len))
-
-    cos_seq = cos[:N]
-    sin_seq = sin[:N]
-
-    expected_dim = D // 2
-    actual_dim = cos_seq.shape[-1]
-
-    if actual_dim != expected_dim:
-        if actual_dim < expected_dim:
-            pad_size = expected_dim - actual_dim
-            cos_seq = F.pad(cos_seq, (0, pad_size))
-            sin_seq = F.pad(sin_seq, (0, pad_size))
-        else:
-            cos_seq = cos_seq[..., :expected_dim]
-            sin_seq = sin_seq[..., :expected_dim]
-
-    cos_expanded = cos_seq.repeat_interleave(2, dim=-1)
-    sin_expanded = sin_seq.repeat_interleave(2, dim=-1)
-
-    cos_slice = cos_expanded.view(1, N, 1, D)
-    sin_slice = sin_expanded.view(1, N, 1, D)
-
+    cos_slice = cos[:N].view(1, N, 1, D)
+    sin_slice = sin[:N].view(1, N, 1, D)
     x_half = x.reshape(B, N, H, D // 2, 2)
     x_rotated = torch.stack([-x_half[..., 1], x_half[..., 0]], dim=-1).reshape(
         B, N, H, D
     )
-
     return x * cos_slice + x_rotated * sin_slice
-
-
-# ============================================================================
-# QUANTIZED LINEAR LAYERS (Optimized for Inference)
-# ============================================================================
-
-
-def activation_quant(x):
-    scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
-    y = (x * scale).round().clamp(-128, 127) / scale
-    return y
 
 
 def weight_quant(w):
     scale = 1.0 / w.abs().mean().clamp(min=1e-5)
-    u = (w * scale).round().clamp(-1, 1) / scale
-    return u
+    return w + (((w * scale).round().clamp(-1, 1) / scale) - w).detach()
 
 
 class BitLinear(nn.Module):
     def __init__(self, in_features, out_features, bias=False):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
         self.weight = nn.Parameter(torch.empty((out_features, in_features)))
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features))
-        else:
-            self.register_parameter("bias", None)
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         self.norm = nn.RMSNorm(in_features)
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x):
-        x_norm = self.norm(x)
-        # Optimized W1.58 A16: No activation quantization (faster, no overhead)
-        # Weights are ternary {-1, 0, 1}, Activations are FP16/BF16
-        w_quant = self.weight + (weight_quant(self.weight) - self.weight).detach()
-        return F.linear(x_norm, w_quant, self.bias)
+        return F.linear(self.norm(x), weight_quant(self.weight), self.bias)
 
 
 class QuantizedLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, bits=1.58):
+    def __init__(self, in_features, out_features, bias=False):
         super().__init__()
         self.linear = BitLinear(in_features, out_features, bias=bias)
 
-    @torch.compiler.disable
     def forward(self, x):
         return self.linear(x)
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x):
-        return self._norm(x.float()).type_as(x) * self.weight.type_as(x)
+        return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(
+            x
+        ) * self.weight
 
 
 # ============================================================================
-# DEEPSEEK V4: REAL ENGRAMS (Context-Aware Gating + Conv)
+# DEEPSEEK V4: REAL ENGRAMS
 # ============================================================================
 
 
 class EngramLayer(nn.Module):
-    """
-    DeepSeek v4 Engrams Implementation (Rigorous)
-    Based on: https://eu.36kr.com/en/p/3637163406624008
-
-    Features:
-    - Multi-head Hashing (K heads per N-gram order)
-    - Context-Aware Gating (Query-Key-Value mechanism)
-    - Depth-Causal Convolution
-    """
-
-    def __init__(self, dim: int, vocab_size: int = 370000, num_heads: int = 4):
+    def __init__(self, dim, vocab_size=370000, num_heads=4):
         super().__init__()
-        self.dim = dim
-        self.vocab_size = vocab_size
-        self.num_heads = num_heads
-
-        # 1. Sparse Retrieval Memory (Conceptually E_{n,k})
-        # We lump all K heads and N-gram orders into one massive table for efficiency
-        # In a strict implementation, these would be separate tables, but learning works similarly
         self.memory_table = nn.Embedding(vocab_size, dim)
-        nn.init.normal_(self.memory_table.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.memory_table.weight, std=0.02)
+        self.W_K = QuantizedLinear(dim, dim)
+        self.W_V = QuantizedLinear(dim, dim)
+        self.conv = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
 
-        # 2. Context-Aware Gating
-        # h_t is Query, e_t (retrieved) is source for Key/Value
-        self.W_K = QuantizedLinear(dim, dim, bias=False)
-        self.W_V = QuantizedLinear(dim, dim, bias=False)
-
-        # Gating projections
-        # We project Q and K to a scalar alpha
-        self.gate_proj = nn.Linear(dim, 1)  # Simplified attention score
-
-        # 3. Convolution
-        # "Short depth-causal convolution" on the retrieved embeddings
-        self.conv = nn.Conv1d(dim, dim, kernel_size=3, padding=2, groups=dim)
-
-    def forward(self, h_t: torch.Tensor, hash_ngrams: torch.Tensor) -> torch.Tensor:
-        """
-        h_t: [B, L, D] - Current hidden state (Dynamic Query)
-        hash_ngrams: [B, L, K] - Precomputed N-gram hashes
-        """
+    def forward(self, h_t, hash_ngrams):
         B, L, D = h_t.shape
-
-        # 1. Sparse Retrieval
-        # Retrieve embeddings for all K hash heads
-        # hash_ngrams is [B, L, K], output is [B, L, K, D]
-        # We sum across K heads (simple aggregation proposed in some variants,
-        # or we could treat them as independent Key/Values. For memory, we sum first here).
-        e_raw = self.memory_table(hash_ngrams)  # [B, L, K, D]
-        e_t = e_raw.sum(dim=2)  # [B, L, D] (Bag of Engrams)
-
-        # 2. Convolution (Depth-causal)
-        # Transpose for Conv1d: [B, D, L]
-        e_conv = self.conv(e_t.transpose(1, 2))
-        e_conv = e_conv[:, :, :L].transpose(1, 2)  # Causal crop -> [B, L, D]
-
-        # 3. Context-Aware Gating
-        # Query = h_t, Key = W_K(e_conv), Value = W_V(e_conv)
-        # Using a simplified Gating scalar mechanism:
-        # alpha = Sigmoid(Norm(h_t) * Norm(e_key)) -> simplified to Linear interaction
-
-        # Proper Gating as per paper inspiration:
-        # G = Sigmoid(W_g [h_t; e_conv])
-        # But paper says "RMSNorm on Q and K before calculating scalar gate"
-
+        e_t = self.memory_table(hash_ngrams).sum(dim=2)
+        e_conv = self.conv(e_t.transpose(1, 2)).transpose(1, 2)[:, :L]
         q_norm = F.rms_norm(h_t, (D,))
         k_norm = F.rms_norm(self.W_K(e_conv), (D,))
-
-        # Element-wise product for similarity, then project to scalar
-        similarity = (q_norm * k_norm).sum(dim=-1, keepdim=True)  # [B, L, 1]
-        alpha = torch.sigmoid(similarity)  # Gate value (0 to 1)
-
-        v_out = self.W_V(e_conv)
-
-        # Residual update
-        return h_t + alpha * v_out
+        alpha = torch.sigmoid((q_norm * k_norm).sum(dim=-1, keepdim=True))
+        return h_t + alpha * self.W_V(e_conv)
 
 
 # ============================================================================
-# DEEPSEEK V3: REAL mHC (Manifold-Constrained Hyper-Connections)
+# DEEPSEEK V3: mHC
 # ============================================================================
 
 
 class ManifoldHyperConnection(nn.Module):
-    """
-    Real mHC Implementation via Sinkhorn-Knopp
-    Based on: https://arxiv.org/html/2512.24880v2
-
-    Constrains the residual mapping H_res to be a Doubly Stochastic Matrix.
-    Uses iterative Sinkhorn normalization (Row norm -> Col norm -> ...).
-    """
-
-    def __init__(self, num_streams: int, num_iters: int = 3):
+    def __init__(self, num_streams, num_iters=3):
         super().__init__()
         self.n = num_streams
         self.num_iters = num_iters
-
-        # The learnable parameter matrix M (unconstrained)
-        # Represents interactions between 'num_streams' parallel information paths.
-        # If the model is a standard Transformer, we split D into 'num_streams' chunks to simulate streams.
         self.raw_weight = nn.Parameter(torch.randn(num_streams, num_streams) * 0.02)
 
-    def sinkhorn_knopp(self, w: torch.Tensor) -> torch.Tensor:
-        """
-        Iteratively normalize rows and columns to sum to 1.
-        Starting point: exp(w) to ensure positivity.
-        """
-        # 1. Positivity
+    def sinkhorn_knopp(self, w):
         M = torch.exp(w)
-
-        # 2. Iterative Normalization
         for _ in range(self.num_iters):
-            # Row Norm
             M = M / (M.sum(dim=1, keepdim=True) + 1e-6)
-            # Col Norm
             M = M / (M.sum(dim=0, keepdim=True) + 1e-6)
-
         return M
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, L, D]
-        """
+    def precompute(self):
+        self.register_buffer("cached_H", self.sinkhorn_knopp(self.raw_weight))
+
+    def forward(self, x):
         B, L, D = x.shape
-        # Split D into n streams
-        # [B, L, n, D/n]
-        assert D % self.n == 0, (
-            f"Dimension {D} must be divisible by num_streams {self.n}"
-        )
         stream_dim = D // self.n
-
         x_streams = x.view(B, L, self.n, stream_dim)
-
-        # Compute H_res (Doubly Stochastic Matrix)
-        H_res = self.sinkhorn_knopp(self.raw_weight)  # [n, n]
-
-        # Apply mixing: H_res * x_streams
-        # We want to mix the 'n' dimension
-        # Einsum: b l n d, n m -> b l m d (where n=m=num_streams)
-        out_streams = torch.einsum("blnd,nm->blmd", x_streams, H_res)
-
-        # Merge back
-        return out_streams.reshape(B, L, D)
+        H_res = getattr(self, "cached_H", self.sinkhorn_knopp(self.raw_weight))
+        return torch.einsum("blnd,nm->blmd", x_streams, H_res).reshape(B, L, D)
 
 
 # ============================================================================
-# TRANSFORMER & MLP
+# TRANSFORMER: LIGHTNING ATTENTION 2
 # ============================================================================
 
 
 class SwiGLUMLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int = None, multiple_of: int = 256):
+    def __init__(self, dim, hidden_dim=None):
         super().__init__()
-        hidden_dim = hidden_dim or 4 * dim
-        hidden_dim = int(2 * hidden_dim / 3)
-        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-
-        self.w1 = QuantizedLinear(dim, hidden_dim, bias=False)
-        self.w2 = QuantizedLinear(hidden_dim, dim, bias=False)
-        self.w3 = QuantizedLinear(dim, hidden_dim, bias=False)
+        hidden_dim = hidden_dim or int(8 * dim / 3)
+        self.w1, self.w2, self.w3 = (
+            QuantizedLinear(dim, hidden_dim),
+            QuantizedLinear(hidden_dim, dim),
+            QuantizedLinear(dim, hidden_dim),
+        )
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class LightningAttention2(nn.Module):
-    def __init__(self, dim, num_heads=8, chunk_size=128):
+    def __init__(self, dim, num_heads=8):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
-
         self.qkv = QuantizedLinear(dim, dim * 3, bias=False)
         self.proj = QuantizedLinear(dim, dim, bias=False)
         self.norm = RMSNorm(dim)
+        self.s = nn.Parameter(torch.full((num_heads,), 0.02))
 
-    def forward(self, x, cos=None, sin=None, mask=None):
+    def forward(self, x, cos=None, sin=None, mask=None, kv_cache=None):
         B, N, C = x.shape
-        # QKV
-        qkv = self.qkv(x)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2)
 
-        # RoPE
         if cos is not None and sin is not None:
-            q = apply_rope(q, cos, sin)
-            k = apply_rope(k, cos, sin)
+            offset = kv_cache[1] if kv_cache is not None else 0
+            q = apply_rope(q, cos[offset : offset + N], sin[offset : offset + N])
+            k = apply_rope(k, cos[offset : offset + N], sin[offset : offset + N])
 
-        # Transpose for SDPA: (B, H, N, D)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        if kv_cache is not None:
+            prev_s, offset = kv_cache
+        else:
+            prev_s = torch.zeros(
+                B,
+                self.num_heads,
+                self.head_dim,
+                self.head_dim,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            offset = 0
 
-        # Flash Attention / SDPA (Automatically selects efficient kernel on T4)
-        # is_causal=True handles the masking automatically and efficiently
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
-        )
+        if TRITON_AVAILABLE and N > 1 and not torch.jit.is_scripting():
+            out = lightning_attn2_fn(q, k, v, self.s)
+            # Recursive update for state (vectorized loop)
+            decay = (-self.s).exp().view(1, self.num_heads, 1, 1)
+            curr_s = prev_s
+            for i in range(N):
+                curr_s = decay * (
+                    curr_s + torch.einsum("bhd,bhe->bhde", k[:, i], v[:, i])
+                )
+        else:
+            decay = (-self.s).exp().view(1, self.num_heads, 1, 1)
+            out_list = []
+            curr_s = prev_s
+            for i in range(N):
+                ki, vi = k[:, i], v[:, i]
+                # Formula matching Triton for N=1: o = q @ (kv + k^T v); new_kv = exp(-s) * (kv + k^T v)
+                state_with_current = curr_s + torch.einsum("bhd,bhe->bhde", ki, vi)
+                oi = torch.einsum(
+                    "bhd,bhde->bhe", q[:, i] * self.scale, state_with_current
+                )
+                out_list.append(oi)
+                curr_s = decay * state_with_current
+            out = torch.stack(out_list, dim=1)
 
-        out = out.transpose(1, 2).reshape(B, N, C)
-        return self.proj(self.norm(out))
+        return self.proj(self.norm(out)), (curr_s, offset + N)
 
 
 class Transformer(nn.Module):
-    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, dropout=0.0):
+    def __init__(self, dim, num_heads=8):
         super().__init__()
-        self.norm1 = RMSNorm(dim)
-        self.attn = LightningAttention2(dim, num_heads)
+        self.norm1, self.attn, self.mhc_attn = (
+            RMSNorm(dim),
+            LightningAttention2(dim, num_heads),
+            ManifoldHyperConnection(16),
+        )
+        self.norm2, self.mlp, self.mhc_mlp = (
+            RMSNorm(dim),
+            SwiGLUMLP(dim),
+            ManifoldHyperConnection(16),
+        )
 
-        # mHC: Manifold Constraint on Residual
-        # We assume 16 streams for effective manifold mixing (arbitrary but typically = num_heads)
-        self.mhc_attn = ManifoldHyperConnection(num_streams=16)
-
-        self.norm2 = RMSNorm(dim)
-        self.mlp = SwiGLUMLP(dim)
-        self.mhc_mlp = ManifoldHyperConnection(num_streams=16)
-
-    def forward(self, x, cos=None, sin=None, mask=None):
-        # Attention Block
-        # Standard: x = x + attn(norm(x))
-        # mHC: x = mHC(x) + attn(norm(x)) OR x = mHC(x + attn(norm(x)))?
-        # Paper says: "constrain the residual mapping H_res".
-        # Equation: x_{l+1} = H_res * x_l + f(x_l)
-
-        # 1. Apply mHC to the IDENTITY path (modifying the residual stream state)
+    def forward(self, x, cos, sin, mask=None, kv_cache=None):
+        # Attention block with mHC mixing
         x_mixed = self.mhc_attn(x)
-
-        # 2. Apply Function (Attention)
-        attn_out = self.attn(self.norm1(x), cos, sin, mask)
-
-        # 3. Combine
+        attn_out, next_kv = self.attn(self.norm1(x), cos, sin, mask, kv_cache)
         x = x_mixed + attn_out
 
-        # MLP Block
-        x_mixed = self.mhc_mlp(x)
-        mlp_out = self.mlp(self.norm2(x))
-        x = x_mixed + mlp_out
-
-        return x
+        # MLP block with mHC mixing
+        x = self.mhc_mlp(x) + self.mlp(self.norm2(x))
+        return x, next_kv
 
 
 # ============================================================================
-# MAIN MODEL: ULTRA-EFFICIENT TEXT JEPA (ShuTKA-v2)
+# MAIN MODEL: ULTRA-EFFICIENT TEXT JEPA
 # ============================================================================
 
 
@@ -371,149 +693,57 @@ class UltraEfficientTextJEPA(nn.Module):
     def __init__(
         self,
         vocab_size=100277,
-        source_dim=512,  # Resized for 350M target
+        source_dim=512,
         source_depth=24,
-        target_dim=512,
-        target_depth=6,
-        predictor_dim=512,
-        predictor_depth=6,
-        output_dim=512,
-        max_source_len=4096,
-        max_target_len=512,
         engram_vocab_size=370000,
-        gradient_checkpointing=False,
         **kwargs,
     ):
         super().__init__()
-        print("Initializing ShuTKA-v2 (DeepSeek v3/v4 Rigorous Spec)...")
-        print(
-            "  Features: bf16, Real Engrams (Gated+Conv), Real mHC (Sinkhorn), SwiGLU"
-        )
-
         self.vocab_size = vocab_size
-        self.source_dim = source_dim
-
         self.token_embed = nn.Embedding(vocab_size, source_dim)
         nn.init.normal_(self.token_embed.weight, std=0.02)
-
-        # DeepSeek v4 Engrams Layer
-        # Placed after embedding, before transformer blocks
         self.engram = EngramLayer(source_dim, vocab_size=engram_vocab_size)
-
         self.blocks = nn.ModuleList(
             [Transformer(source_dim, num_heads=16) for _ in range(source_depth)]
         )
-
         self.norm = RMSNorm(source_dim)
-
-        cos, sin = precompute_rope_freqs(source_dim // 16, max_source_len)
+        self.lm_head = QuantizedLinear(source_dim, vocab_size)
+        self.lm_head.linear.weight = self.token_embed.weight
+        cos, sin = precompute_rope_freqs(source_dim // 16, 4096)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-        self.predictor_blocks = nn.ModuleList(
-            [Transformer(predictor_dim, num_heads=16) for _ in range(predictor_depth)]
-        )
-        self.predictor_norm = RMSNorm(predictor_dim)
-        self.predictor_proj = QuantizedLinear(source_dim, output_dim)
-
-        self.lm_head = QuantizedLinear(output_dim, vocab_size)
-        self.lm_head.linear.weight = self.token_embed.weight
+    def precompute_mhc(self):
+        for b in self.blocks:
+            b.mhc_attn.precompute()
+            b.mhc_mlp.precompute()
 
     def forward(
         self,
-        source_tokens: torch.Tensor,
-        target_tokens: Optional[torch.Tensor] = None,
-        hash_ngrams: Optional[torch.Tensor] = None,
-        return_embeddings: bool = False,
+        source_tokens,
+        target_tokens=None,
+        hash_ngrams=None,
+        return_embeddings=False,
+        past_key_values=None,
         **kwargs,
     ):
-        B, L = source_tokens.shape
         x = self.token_embed(source_tokens)
-
-        # Apply Real Engrams (DeepSeek v4)
         if hash_ngrams is not None:
             x = self.engram(x, hash_ngrams)
-
-        cos = self.cos[:L]
-        sin = self.sin[:L]
-
-        for block in self.blocks:
-            x = block(x, cos, sin)
-
-        x = self.norm(x)
-
-        if return_embeddings:
-            return x
-
-        logits = self.lm_head(x)
-
-        if target_tokens is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = target_tokens[..., 1:].contiguous()
-
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.vocab_size), shift_labels.view(-1)
+        new_kvs = []
+        for i, block in enumerate(self.blocks):
+            x, layer_kv = block(
+                x,
+                self.cos,
+                self.sin,
+                kv_cache=(past_key_values[i] if past_key_values else None),
             )
-
-            # Return tuple to satisfy Trainer unpacking (loss, _, _)
-            return loss, logits, None
-
-        return logits
-
-    def predict_next(self, x, hash_ngrams=None):
-        return self.forward(x, hash_ngrams)
-
-
-# ============================================================================
-# OPTIMIZER (GALORE + MUON)
-# ============================================================================
-
-
-class Optimizer(torch.optim.Optimizer):
-    def __init__(
-        self, params, lr=1e-4, rank=128, update_freq=200, cans_steps=5, delta=0.3
-    ):
-        defaults = dict(
-            lr=lr,
-            rank=rank,
-            update_freq=update_freq,
-            cans_steps=cans_steps,
-            delta=delta,
-        )
-        super().__init__(params, defaults)
-        self.rank = rank
-        self.update_freq = update_freq
-        self.cans_steps = cans_steps
-        self.projections = {}
-        self.momentum = {}
-        self.step_count = 0
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-        self.step_count += 1
-
-        for group in self.param_groups:
-            lr = group["lr"]
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                grad = p.grad
-                if grad.dim() < 2:
-                    p.data.add_(grad, alpha=-lr)
-                    continue
-
-                if id(p) not in self.momentum:
-                    self.momentum[id(p)] = torch.zeros_like(grad)
-
-                buf = self.momentum[id(p)]
-                buf.mul_(0.9).add_(grad, alpha=1.0)
-
-                p.data.add_(buf, alpha=-lr)
-
-        return loss
+            new_kvs.append(layer_kv)
+        logits = self.lm_head(self.norm(x))
+        if target_tokens is not None:
+            loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, self.vocab_size),
+                target_tokens[:, 1:].reshape(-1),
+            )
+            return loss, logits, new_kvs
+        return (x if return_embeddings else logits), new_kvs
